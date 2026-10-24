@@ -654,12 +654,24 @@ static int64_t sym_intern_nolock(uint32_t hash, const char* str, size_t len) {
     return main_id;
 }
 
+/* A sym's name is a C string: bytes past the first NUL are not part of the
+ * name — interning "abc\0def" interns "abc", and "abc\0def" names the same
+ * sym as "abc" (kdb's own syms are cstrings; string `$"abc\000def" is "abc").
+ * Truncate BEFORE hashing/probing so every bucket, compare and stored copy
+ * agrees on the one identity. */
+static size_t sym_name_len(const char* str, size_t len) {
+    if (!len) return 0;
+    const char* nul = (const char*)memchr(str, 0, len);
+    return nul ? (size_t)(nul - str) : len;
+}
+
 /* --------------------------------------------------------------------------
  * ray_sym_intern — locked public API
  * -------------------------------------------------------------------------- */
 
 int64_t ray_sym_intern(const char* str, size_t len) {
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return -1;
+    len = sym_name_len(str, len);
     uint32_t hash = (uint32_t)ray_hash_bytes(str, len);
     sym_lock();
     int64_t id = sym_intern_nolock(hash, str, len);
@@ -675,7 +687,11 @@ int64_t ray_sym_intern_runtime(const char* str, size_t len) {
  * ray_sym_intern_prehashed -- intern with pre-computed hash, no lock.
  *
  * CALLER CONTRACT: must only be called when no other thread is interning
- * (e.g., after ray_pool_dispatch returns during CSV merge).
+ * (e.g., after ray_pool_dispatch returns during CSV merge), AND str[0..len)
+ * must already be the NAME — a name is a cstring, so bytes past a NUL are not
+ * part of it.  A producer that can see embedded NULs truncates at its own
+ * scan (or calls ray_sym_intern, which does it here); this door stays a
+ * one-pass hash+probe — checking again is why it exists not to.
  * -------------------------------------------------------------------------- */
 
 int64_t ray_sym_intern_prehashed(uint32_t hash, const char* str, size_t len) {
@@ -710,11 +726,14 @@ int ray_sym_segs(int64_t sym_id, const int64_t** out_segs) {
 int64_t ray_sym_find(const char* str, size_t len) {
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return -1;
 
+    /* Name truncation + hash are pure over the caller's buffer — run them
+     * OUTSIDE the lock so the critical section is only the bucket walk. */
+    len = sym_name_len(str, len);
+    uint32_t hash = (uint32_t)ray_hash_bytes(str, len);
+
     /* Lock required: concurrent ray_sym_intern may trigger ht_grow which
      * frees and replaces g_sym.buckets -- reading without lock is UAF. */
     sym_lock();
-
-    uint32_t hash = (uint32_t)ray_hash_bytes(str, len);
     uint32_t mask = g_sym.bucket_cap - 1;
     uint32_t slot = hash & mask;
 

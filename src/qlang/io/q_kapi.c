@@ -1279,7 +1279,10 @@ static void dl_candidates(const char* lib, dl_paths* c) {
             const char* slash = dl_lastsep(script);
             if (slash) {
                 script[slash - script + 1] = '\0';
-                char dir[576];
+                /* Worst case is script's and lib's buffer bounds (511+511):
+                 * dir must prove it cannot truncate or -Wformat-truncation
+                 * fires. */
+                char dir[512 + 512];
                 snprintf(dir, sizeof dir, "%s%s", script, p);
                 dl_add(c, "%s%s", dir, ext);
             }
