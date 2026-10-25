@@ -416,20 +416,29 @@ ray_t* q_search_find(ray_t* x, ray_t* y) {
             ray_t** e = (ray_t**)ray_data(y);
             ray_t* out = ray_list_new(ny > 0 ? ny : 1);
             if (RAY_IS_ERR(out)) return out;
+            /* Many whole-item probes: hash the domain once — the run arm's
+             * ruling on scan-vs-hash, the same FIND_SCAN_NEEDLES the vec and
+             * row finds use (a tuple-key dict's `d[keys]` rides this). */
+            ray_t* hp = NULL;
+            if (x->type == RAY_LIST && cnt > 0 && ny > 64)
+                hp = ray_find_list_items(x, y);        /* owned */
+            if (hp && RAY_IS_ERR(hp)) { ray_release(out); return hp; }
+            const int64_t* hpos = hp ? (const int64_t*)ray_data(hp) : NULL;
             for (int64_t j = 0; j < ny; j++) {
                 ray_t* rr;
                 int ed = q_index_rank(e[j]);
                 if (!e[j] || cnt == 0 || (xd > 0 && ed == 0))
                     rr = ray_i64(cnt);
                 else if (xd > 0 && ed <= xd)
-                    rr = ray_i64(q_search_find_item(x, e[j], cnt));
+                    rr = ray_i64(hpos ? hpos[j] : q_search_find_item(x, e[j], cnt));
                 else
                     rr = q_search_find(x, e[j]);
-                if (!rr || RAY_IS_ERR(rr)) { ray_release(out); return rr; }
+                if (!rr || RAY_IS_ERR(rr)) { if (hp) ray_release(hp); ray_release(out); return rr; }
                 out = ray_list_append(out, rr);      /* retains */
                 ray_release(rr);
-                if (RAY_IS_ERR(out)) return out;
+                if (RAY_IS_ERR(out)) { if (hp) ray_release(hp); return out; }
             }
+            if (hp) ray_release(hp);
             ray_t* c = q_list_collapse(out);
             ray_release(out);
             return c;

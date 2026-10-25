@@ -615,6 +615,9 @@ ray_t* ray_sect_fn(ray_t* vec1, ray_t* vec2);
 ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj);
 ray_t* ray_at_fn(ray_t* vec, ray_t* idx);
 ray_t* ray_find_fn(ray_t* vec, ray_t* val);
+/* Whole-item Find of LIST y's items in LIST x via one hashset build —
+ * RAY_I64 positions, len = count y, miss = count x. */
+ray_t* ray_find_list_items(ray_t* x, ray_t* y);
 /* [*lo, *hi) of a null-free RAY_ATTR_SORTED vector holding values in [a, b] (same-type atoms; b NULL = a); false
  * when the lane does not apply — the scan owns promotion, nulls and every other type. */
 bool   ray_sorted_span(ray_t* vec, ray_t* a, ray_t* b, int64_t* lo, int64_t* hi);

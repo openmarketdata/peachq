@@ -480,6 +480,11 @@ ray_t* q_handles_broadcast(ray_t* handles, ray_t* msg) {
     int atom = handles->type == -RAY_I64 || handles->type == -RAY_I32;
     if (!atom && handles->type != RAY_I64 && handles->type != RAY_I32) return q_err(QE_TYPE);
     int64_t  n   = atom ? 1 : q_count(handles);
+    /* n is an i64: without a bound, (size_t)n*8 ranges to 2^64-8 in the
+     * compiler's size analysis (-Walloc-size-larger-than), and a negative n
+     * really would wrap to that.  q_count never yields it; the check is the
+     * proof either way. */
+    if (n < 0 || n > INT64_MAX / (int64_t)sizeof(int64_t)) return q_err(QE_LIMIT);
     int64_t* ids = n ? (int64_t*)malloc((size_t)n * sizeof(int64_t)) : NULL;
     if (n && !ids) return q_err(QE_OOM);
     for (int64_t i = 0; i < n; i++) {

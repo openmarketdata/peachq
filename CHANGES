@@ -1,0 +1,27 @@
+0.89
+2026.10.23
+NUC 
+sym_intern_prehashed now properly truncates to name length before hashing
+was
+q)string `$"abc\000def"
+"abc\000def"
+now
+q)string `$"abc\000def"
+"abc"
+
+FIX
+the compiler-warning sweep: size bounds for -Walloc-size-larger-than, -Wformat-truncation (q_kapi.c, q_handles.c, q_kafka.c) and explicit inits for -Wmaybe-uninitialized (q_adverb.c, q_duckdb.c)
+
+improved `date$ on a timestamp vector: the vectorized numeric-cast worker was a per-element boxed cast (collection_elem + dispatch + an atom per cell)
+was
+q)\t `date$12000000?.z.p
+1260
+now
+q)\t `date$12000000?.z.p
+135
+
+improved `d[ks]` on tuple-keyed dictionaries, and `x?y` on a general-list x: the domain's keys are hashed once and each probe is O(1), was a linear atom_eq scan per probe, ~100x slower than kdb
+
+
+
+

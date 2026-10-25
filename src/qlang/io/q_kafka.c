@@ -29,6 +29,7 @@
 #include "lang/eval.h"              /* RAY_FN_NONE */
 #include "table/sym.h"              /* ray_sym_str */
 #include <rayforce.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1123,8 +1124,13 @@ typedef struct { int64_t lo, hi, timeout; int ts; } kfk_range;   /* lo < 0 = a t
  * exclusive end per element in *ends; an empty partition is left out */
 static rd_kafka_topic_partition_list_t* kfk_read_plan(rd_kafka_t* rk, const char* topic, const int32_t* ids, int cnt,
                                                       const kfk_range* r, int64_t** ends, ray_t** err) {
+    /* cnt is int and can wrap negative from a >2^31 count; the bound is also
+     * the compiler's proof that the ends alloc can't reach ~2^64
+     * (-Walloc-size-larger-than). */
+    if (cnt < 0) { *err = q_err(QE_LIMIT); return NULL; }
     rd_kafka_topic_partition_list_t* l = A.topic_partition_list_new(cnt ? cnt : 1);
     *ends = malloc(sizeof(int64_t) * (size_t)(cnt ? cnt : 1));
+    if (!*ends) { A.topic_partition_list_destroy(l); *err = q_err(QE_OOM); return NULL; }
     *err = NULL;
     int n = 0;
     rd_kafka_topic_partition_list_t* asked = A.topic_partition_list_new(cnt ? cnt : 1);
@@ -1176,9 +1182,15 @@ static ray_t* kfk_read_fn(ray_t** args, int64_t n) {
     int32_t* ids = NULL; int cnt = 0;
     if (RAY_IS_NULL(want)) e = kfk_partitions_of(rk, topic, &ids, &cnt);
     else {                                          /* the asked-for partitions as given: an unknown one is the broker's refusal */
-        cnt = q_type_is_int_atom(want) ? 1 : (int)q_count(want);
-        ids = malloc(sizeof(int32_t) * (size_t)(cnt ? cnt : 1));
-        for (int i = 0; i < cnt; i++) ids[i] = (int32_t)(q_type_is_int_atom(want) ? q_type_as_i64(want) : q_type_ivec_get(want, i));
+        int64_t np = q_type_is_int_atom(want) ? 1 : q_count(want);
+        if (np > INT_MAX) e = q_err(QE_LIMIT);      /* the partition list counts in ints; also bounds the ids alloc for the compiler */
+        else {
+            cnt = (int)np;
+            ids = malloc(sizeof(int32_t) * (size_t)(cnt ? cnt : 1));
+            if (ids)
+                for (int i = 0; i < cnt; i++) ids[i] = (int32_t)(q_type_is_int_atom(want) ? q_type_as_i64(want) : q_type_ivec_get(want, i));
+            else e = q_err(QE_OOM);
+        }
     }
     int64_t* ends = NULL;
     rd_kafka_topic_partition_list_t* l = e ? NULL : kfk_read_plan(rk, topic, ids, cnt, &r, &ends, &e);

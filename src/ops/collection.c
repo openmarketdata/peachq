@@ -67,6 +67,42 @@ typedef struct hashset_t {
     void*    src_data;     /* pointer to typed data (or RAY_LIST elements) */
 } hashset_t;
 
+/* One boxed element as hash — the same law as hs_eq_rows' boxed atom_eq
+ * arm: numerics normalize through f64 so distinct numeric types holding
+ * the same value collide, and a nested LIST mixes its items' hashes so a
+ * tuple row spreads across buckets instead of one type-tag chain (a
+ * tuple-key dict's Find and group's LIST keys both ride this). */
+static uint64_t hs_hash_elem(ray_t* e) {
+    if (!e || RAY_ATOM_IS_NULL(e)) return 0;
+    /* Numeric coercion: hash as f64 so distinct numeric types
+     * holding the same value collide (atom_eq does the same). */
+    if (is_numeric(e)) return ray_hash_f64(as_f64(e));
+    switch (e->type) {
+        case -RAY_SYM:       return ray_hash_i64(e->i64);
+        case -RAY_DATE:
+        case -RAY_TIME:
+        case -RAY_MONTH:
+        case -RAY_MINUTE:
+        case -RAY_SECOND:    return ray_hash_i64((int64_t)e->i32);
+        case -RAY_TIMESTAMP:
+        case -RAY_TIMESPAN:  return ray_hash_i64(e->i64);
+        case -RAY_DATETIME:  return ray_hash_f64(e->f64);
+        case -RAY_GUID:      return ray_hash_bytes(ray_guid_bytes((ray_t*)e), 16);
+        case -RAY_STR:
+            return ray_hash_bytes(ray_str_ptr(e), ray_str_len(e));
+        case RAY_LIST: {
+            ray_t** es = (ray_t**)ray_data(e);
+            uint64_t h = ray_hash_i64(e->len);
+            for (int64_t j = 0; j < e->len; j++)
+                h = ray_hash_combine(h, hs_hash_elem(es[j]));
+            return h;
+        }
+        default:
+            /* Unknown / unsupported atom kind: hash by type tag. */
+            return ray_hash_i64((int64_t)e->type);
+    }
+}
+
 /* Hash a single row at index i in src.  Mirrors atom_eq's coercion
  * rules: numeric types normalize through f64 so an I64 atom and an
  * F64 atom holding the same value collide (boxed-list path only — a
@@ -107,28 +143,7 @@ static uint64_t hs_hash_row(ray_t* src, int64_t i, int8_t t, void* data) {
         }
         case RAY_LIST: {
             ray_t** elems = (ray_t**)data;
-            ray_t* e = elems[i];
-            if (!e || RAY_ATOM_IS_NULL(e)) return 0;
-            /* Numeric coercion: hash as f64 so distinct numeric types
-             * holding the same value collide (atom_eq does the same). */
-            if (is_numeric(e)) return ray_hash_f64(as_f64(e));
-            switch (e->type) {
-                case -RAY_SYM:       return ray_hash_i64(e->i64);
-                case -RAY_DATE:
-                case -RAY_TIME:
-                case -RAY_MONTH:
-                case -RAY_MINUTE:
-                case -RAY_SECOND:    return ray_hash_i64((int64_t)e->i32);
-                case -RAY_TIMESTAMP:
-                case -RAY_TIMESPAN:  return ray_hash_i64(e->i64);
-                case -RAY_DATETIME:  return ray_hash_f64(e->f64);
-                case -RAY_GUID:      return ray_hash_bytes(ray_guid_bytes((ray_t*)e), 16);
-                case -RAY_STR:
-                    return ray_hash_bytes(ray_str_ptr(e), ray_str_len(e));
-                default:
-                    /* Unknown / unsupported atom kind: hash by type tag. */
-                    return ray_hash_i64((int64_t)e->type);
-            }
+            return hs_hash_elem(elems[i]);
         }
         default:
             return ray_hash_i64(i);
@@ -2160,6 +2175,31 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
     }
     if (_bx) ray_release(_bx);
     return ray_typed_null(-RAY_I64); /* 0Nl = not found */
+}
+
+/* Whole-item Find of a LIST y's items in a LIST x — one hashset build over
+ * x's rows, then a probe per item; the miss is cnt, the law Find reads off
+ * q_search_find_item.  Every item is a whole-key probe: a deeper item can
+ * never equal a shallower row (atom_eq's LIST-vs-atom arm fails), so the
+ * hash answers honestly at any item rank — the caller still picks which
+ * items take it, a deeper item being a run the rank law splits.  RAY_I64,
+ * len = count y. */
+ray_t* ray_find_list_items(ray_t* x, ray_t* y) {
+    int64_t cnt = ray_len(x), ny = ray_len(y);
+    ray_t* out = ray_vec_new(RAY_I64, ny > 0 ? ny : 1);
+    if (RAY_IS_ERR(out)) return out;
+    out->len = ny;
+    int64_t* d = (int64_t*)ray_data(out);
+    hashset_t hs;
+    if (!hashset_init(&hs, x, cnt)) { ray_release(out); return ray_error("oom", NULL); }
+    for (int64_t i = 0; i < cnt; i++) hashset_insert(&hs, i);
+    int8_t yt = y->type; void* yd = ray_data(y);
+    for (int64_t j = 0; j < ny; j++) {
+        int64_t r = hashset_find_xrow(&hs, y, j, yt, yd);
+        d[j] = r == HS_EMPTY ? cnt : r;
+    }
+    hashset_destroy(&hs);
+    return out;
 }
 
 /* ===== Find over ROWS ======================================================

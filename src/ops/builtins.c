@@ -1388,6 +1388,12 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
          * arm's semantics); int-family stays on the generic fast path. */
         if (ray_is_vec(val)) {
             if (val->type == RAY_DATE) { ray_retain(val); return val; }
+            /* TIMESTAMP -> DATE is a leaf of the fast numeric worker
+             * (cast_range_worker: ts_days_floor per element, parallel +
+             * null-bitmap + cancel) — route it there; the boxing
+             * per-element path is for temporal pairs the worker lacks. */
+            if (val->type == RAY_TIMESTAMP)
+                return cast_vec_numeric(type_sym, val, RAY_DATE);
             if (RAY_IS_TEMPORAL32(val->type) || RAY_IS_TEMPORAL64(val->type) ||
                 RAY_IS_TEMPORALF(val->type))
                 return cast_vec_temporal_elems(type_sym, val, RAY_DATE);
