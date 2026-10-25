@@ -1,0 +1,2 @@
+'.
+  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t233.q:1: f:{i:0;j:0;.+(`inci`incj;({i+:1;i};{j+:1;j}))}

@@ -1,0 +1,22 @@
++
++-
++-*
++-first%
+system
+system+
+4:5:
+system+'
+4:5:+-
++?
+?+
++sqr
+sqr+
++-?
+?+-
++-sqr
+sqr+-
++-first?
+?+-*
++-first sqr
+sqr+-*
+\\

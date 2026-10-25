@@ -1,0 +1,3 @@
+'2026.10.25T09:17:52.188 .
+  [2]  /mnt/c/wsl/workspace/kx/peachq/tests/t192.q:1: d:.+(`a`b`c;1 2 3)
+                                                        ^

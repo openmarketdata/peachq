@@ -1,0 +1,5 @@
+'@
+  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t427.q:1: show:{[t]                                 / show
+ if[(@*t[])|1<#?#'t[]                     / if not a table
+  :((-|/#'$k)$k:!t),'" : ",/5:'t[]]
+ t}

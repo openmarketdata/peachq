@@ -1,0 +1,2 @@
+',
+  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t373.q:1: f:{if[x;f[x-1]];`0:,$x}

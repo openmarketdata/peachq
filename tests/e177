@@ -1,0 +1,4 @@
+'2026.10.25T09:17:51.530 .
+  [2]  /mnt/c/wsl/workspace/kx/peachq/tests/t177.q:1: d:.((`a;1;)
+                                                        ^
+    (`b;8 9;)

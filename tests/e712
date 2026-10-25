@@ -1,0 +1,2 @@
+'type
+  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t712.q:8: `a . 1                                / 20  -- . still derefs

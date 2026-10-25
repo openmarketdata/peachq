@@ -1,0 +1,2 @@
+'lgamma
+  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t506.q:3: lgamma[1+y]+lgamma[1+x-y]

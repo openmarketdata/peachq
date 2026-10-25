@@ -1,0 +1,2 @@
+'!
+  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t460.q:9: f:{[a;b;c;d;e]a,b,c,d,e}[1;;(!10;!10);;.+(`a`b;1 2)]

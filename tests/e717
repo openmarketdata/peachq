@@ -1,0 +1,2 @@
+'#
+  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t717.q:3: (#"."in') ("a.b";"cd";"e.e")   / 3     -- #("." in' x) = #(1 0 1)

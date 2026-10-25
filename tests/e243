@@ -1,0 +1,8 @@
+'r
+  [1]  /mnt/c/wsl/workspace/kx/peachq/tests/t243.q:2: pet:{[name;species]
+  name0:name
+  species0:species
+  r.getname:{name0}
+  r.getspecies:{species0}
+  r}
+  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t243.q:22: mypet:pet["BigT";"Dinosaur"]

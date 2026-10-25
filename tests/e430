@@ -1,0 +1,21 @@
+'@
+  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/show.k:2: show0:{[t]                           / show
+ if[(@*t[])|1<#?#'t[]                / if not a table
+  :((-|/#'$k)$k:!t),/" : ",/5:'t[]]  / use dict display
+ i:(^t[])1                           / count
+ j:@[t;nul;{(1|i)#x}]                / empty
+ f:{$[4:x;x;1_,/" ",/x]}             / nested
+ k:f''+$+j[]                         / data
+ l:+,$!j                             / labels
+ m:1 -1(4:'t[])lin 0 -4              / data justifications
+ n:(|/#')'{x,y}'[l;k]                / widths
+ l:" ",''(-n)$l                      / padded labels
+ k:" ",''(m*n)$k                     / padded data
+ o:+," ",'n#'"-"                     / separators
+ p:&-2=4:'t[]                        / where float
+ p@:&(|/"."in')'k p                  / where decimals
+ q:(*&)''"."=k p                     / where decimals in
+ r:q-&/'q dv'0                       / rotation matrix
+ k[p]:r!''k p                        / align on decimals
+ s:,'/l,'o,'k                        / result
+ s}                                  / matrix

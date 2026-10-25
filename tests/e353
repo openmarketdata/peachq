@@ -1,0 +1,5 @@
+'type
+  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t353.q:7: while[a
+  a:a-1
+  b:b+1
+  c:c+1]

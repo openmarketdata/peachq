@@ -1,0 +1,5 @@
+'type
+  [1]  /mnt/c/wsl/workspace/kx/peachq/tests/t452.q:3: f:{
+  r:x+y
+  r}
+  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t452.q:6: f[4;5]

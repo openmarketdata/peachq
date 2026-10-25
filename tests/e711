@@ -1,0 +1,3 @@
+'c
+  [1]  /mnt/c/wsl/workspace/kx/peachq/tests/t711.q:6: {[a;b]a+b+c}
+  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t711.q:8: p 2                                   / 17 -- returned closed projection

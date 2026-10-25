@@ -1,0 +1,2 @@
+'type
+  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t788.q:11: 2~{$[x<2;0.0;0]}{x+1}/0

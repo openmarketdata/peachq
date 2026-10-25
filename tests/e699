@@ -1,0 +1,2 @@
+'&
+  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t699.q:5: &/((12 18 24 gcd 8 6 30)*12 18 24 lcm 8 6 30)=(12 18 24)*8 6 30
