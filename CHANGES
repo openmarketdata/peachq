@@ -1,6 +1,6 @@
-0.89
-2026.10.23
-NUC 
+0.89 (2026.10.30) 
+(larm64 build, Snapdragon X Plus, Mem Speed 8848MT/s, WSL Utuntu)
+NUC
 sym_intern_prehashed now properly truncates to name length before hashing
 was
 q)string `$"abc\000def"
@@ -21,7 +21,14 @@ q)\t `date$12000000?.z.p
 135
 
 improved `d[ks]` on tuple-keyed dictionaries, and `x?y` on a general-list x: the domain's keys are hashed once and each probe is O(1), was a linear atom_eq scan per probe, ~100x slower than kdb
-
+q)d:((12000?.z.d+til 365),'12000?`3)!(12000?100.0)
+q)s:((1200?.z.d+til 365),'1200?`3),12000?key d
+was
+q)\t d[s]
+934
+now
+q)\t d[s]
+6
 
 
 
