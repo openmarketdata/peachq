@@ -1,5 +1,0 @@
-'c
-  [3]  /mnt/c/wsl/workspace/kx/peachq/tests/t710.q:8: {c}
-  [2]  /mnt/c/wsl/workspace/kx/peachq/tests/t710.q:7: inner:{[f] c:777; f[]}
-  [1]  /mnt/c/wsl/workspace/kx/peachq/tests/t710.q:8: {c:x; inner[{c}]}
-  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t710.q:8: {c:x; inner[{c}]}[5]                 / 5  -- not inner's decoy c=777

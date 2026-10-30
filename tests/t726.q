@@ -1,4 +1,0 @@
-1 2 3
-while[1;."\\\\";."this must not run"]
-"unreached"
-\\

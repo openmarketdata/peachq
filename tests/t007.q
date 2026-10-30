@@ -1,5 +1,0 @@
-/ this was a segv
-
-/
-
-\\

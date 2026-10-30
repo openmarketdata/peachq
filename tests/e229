@@ -1,4 +1,0 @@
-'i
-  [2]  /mnt/c/wsl/workspace/kx/peachq/tests/t229.q:2: {i}
-  [1]  /mnt/c/wsl/workspace/kx/peachq/tests/t229.q:2: f:{i:0;{i}`}
-  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t229.q:3: f`

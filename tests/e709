@@ -1,7 +1,0 @@
-'type
-  [1]  /mnt/c/wsl/workspace/kx/peachq/tests/t709.q:5: t6:{[dep] if[dep>2; :99]
- if[0<dep!2; v:1+t6 dep+1; :v]
- k:0
- while[k<2; b:0+k+t6 dep+1; k:k+1]
- k}
-  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t709.q:10: t6 0

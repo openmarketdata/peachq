@@ -1,6 +1,0 @@
-'type
-  [1]  /mnt/c/wsl/workspace/kx/peachq/tests/t234.q:4: f:{
-  i:0
-  r:{i:5;j:5;(i;j)}`
-  (r;i;j)}
-  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t234.q:8: f`

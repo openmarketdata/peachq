@@ -1,2 +1,0 @@
-'draw
-  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t734.q:7: W:(1+draw[n*n;30])+INF*draw[n*n;4]>2

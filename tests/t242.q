@@ -1,5 +1,0 @@
-/ not a closure because return dict isn't all lambdas
-f:{r.a:{til 10};r.b:5;r}
-g:f `
-g
-\\

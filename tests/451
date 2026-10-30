@@ -1,6 +1,0 @@
-enlist[;1 2]
-enlist[;;1 2]
-enlist[;;;1 2]
-enlist[;1 2;enlist[;3 4]]
-enlist[;;1 2;enlist[;;3 4]]
-enlist[;;;1 2;enlist[;;;3 4]]

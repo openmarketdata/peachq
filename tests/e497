@@ -1,3 +1,0 @@
-'type
-  [1]  /mnt/c/wsl/workspace/kx/peachq/tests/t497.q:1: f:{x {x,y} y}
-  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t497.q:3: f[1;2]

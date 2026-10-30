@@ -1,9 +1,0 @@
-'#
-  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t715.q:6: ks:{[c;w;v]            / ks[capacity;weights;values]
-  m:{$[x<y;y;x]}       / max
-  d::(1+n:#w)#,(1+c)#0 / init dp matrix
-  {p:x[l:y-1]z         / previous row dp value
-   W:w l               / weight
-   V:v l               / value
-   .[x;y,z;:;$[~z<W;m[V+.[x;l,z-W];p];p]]}/[`d;1+!n]'[1+!c]
-  d}

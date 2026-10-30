@@ -1,2 +1,0 @@
-'!
-  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t754.q:9: while[i<40; d:12?-12; if[d~!12;bad::bad+1]; if[~12=#?d;bad::bad+1]; if[|/~(d<12)&d>-1;bad::bad+1]; i::i+1]

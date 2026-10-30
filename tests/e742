@@ -1,2 +1,0 @@
-'*
-  [0]  /mnt/c/wsl/workspace/kx/peachq/tests/t742.q:11: (*{c:5;f:{c*x};,f}[])3                  / enlist       -> 15  (was: dead frame)

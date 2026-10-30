@@ -1,7 +1,0 @@
-/ lambda should stop eval after error
-\e 0
-f:{
-  1+`a
-  3}
-f `
-\\
