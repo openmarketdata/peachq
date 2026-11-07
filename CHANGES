@@ -1,0 +1,28 @@
+(larm64 build, Snapdragon X Plus, Mem Speed 8848MT/s, WSL Ubuntu 26.04, used for performance benchmark)
+(l64 x86_64 build, AMD Ryzen 7950X, Mem Speed 4800MT/s, WSL Ubuntu 26.04)
+
+0.89 (2026.11.03)
+VERIFY KDB-X 2026.10.23 FIX (already in)
+for minute,second,time,timestamp,timespan return null when converting from a string causes overflow of respective type. for example
+ q)"U"$"71582789:00"               / was 00:44 , now 0Nu
+ q)"V"$"596524:00:00"              / was -**:28:16 , now 0Nv
+ q)"T"$"1111111111:00:00.000"      / was -**:36:52.608 , now 0Nt
+ q)"P"$"2020.12.01D11111111111111" / was 2064.10.26D06:34:55.000000000 , now 0Np
+ q)"N"$"106751D23:47:16.9"         / was -106751D23:47:16.809551616 , now 0Nn
+since 2026.10.02, ([]1 2s) could crash. Restored parsing error.
+
+0.89 (2026.10.30) 
+NUC
+sym_intern_prehashed now properly truncates to name length before hashing
+ q)string `$"abc\000def"   / was "abc\000def", now "abc"
+
+FIX
+the compiler-warning sweep: size bounds for -Walloc-size-larger-than, -Wformat-truncation (q_kapi.c, q_handles.c, q_kafka.c) and explicit inits for -Wmaybe-uninitialized (q_adverb.c, q_duckdb.c)
+
+improved `date$ on a timestamp vector: the vectorized numeric-cast worker was a per-element boxed cast (collection_elem + dispatch + an atom per cell)
+ q)\t `date$12000000?.z.p    / was 1260, now 135
+
+improved `d[ks]` on tuple-keyed dictionaries, and `x?y` on a general-list x: the domain's keys are hashed once and each probe is O(1), was a linear atom_eq scan per probe, ~100x slower than kdb
+ q)d:((12000?.z.d+til 365),'12000?`3)!(12000?100.0)
+ q)s:((1200?.z.d+til 365),'1200?`3),12000?key d
+ q)\t d[s]    / was 934, now 6
