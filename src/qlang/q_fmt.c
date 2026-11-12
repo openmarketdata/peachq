@@ -46,6 +46,8 @@ static const char Q_VERBS[] = ":+-*%!&|<>=~,^#_$?@./\\'";
 static int sym_bare(const char* nm, size_t l) {
     if (l == 1 && nm[0] && strchr(Q_VERBS, nm[0])) return 1;
     if (l == 2 && nm[1] == ':' && nm[0] && strchr(Q_VERBS, nm[0])) return 1;
+    if (l == 3 && nm[2] == ':' && ((nm[0] == '<' && (nm[1] == '>' || nm[1] == '=')) || (nm[0] == '>' && nm[1] == '=')))
+        return 1;
     return 0;
 }
 
@@ -76,7 +78,9 @@ static RAY_TLS struct {
     int32_t rows, cols;   /* live `\c` size (already clamped to [10,2000]) */
     int32_t nlines;       /* completed (flushed) display lines */
     int     stop;         /* height cap decided — swallow everything else */
-    char    line[2048];   /* physical prefix of the current line (>= cols) */
+    char*   line;         /* physical prefix of the current line (<= cols): line0, grown on the heap past it */
+    size_t  lcap;
+    char    line0[2048];
     size_t  llen;         /* buffered physical chars (<= cols) */
     size_t  llog;         /* LOGICAL chars on the line, incl. swallowed overflow */
     size_t  ltrail;       /* trailing-space run at the logical end (qe_trim) */
@@ -114,6 +118,15 @@ static void qe_flush_line(qe_tgt* t) {
     g_clip.llen = g_clip.llog = g_clip.ltrail = 0;
 }
 
+static int qe_line_grow(qe_tgt* t) {
+    char* nl = g_clip.line == g_clip.line0 ? malloc(g_clip.lcap * 2) : realloc(g_clip.line, g_clip.lcap * 2);
+    if (!nl) { t->trunc = 1; g_clip.stop = 1; return 0; }   /* stop: a flush would read past the short line */
+    if (g_clip.line == g_clip.line0) memcpy(nl, g_clip.line0, g_clip.lcap);
+    g_clip.line = nl;
+    g_clip.lcap *= 2;
+    return 1;
+}
+
 static void qe_putc(char c) {
     qe_tgt* t = qe_top();
     if (!t->clip) {
@@ -139,7 +152,7 @@ static void qe_putc(char c) {
     }
     g_clip.llog++;
     g_clip.ltrail = (c == ' ') ? g_clip.ltrail + 1 : 0;
-    if (g_clip.llen < (size_t)g_clip.cols && g_clip.llen < sizeof g_clip.line - 1)
+    if (g_clip.llen < (size_t)g_clip.cols && (g_clip.llen < g_clip.lcap || qe_line_grow(t)))
         g_clip.line[g_clip.llen++] = c;
 }
 
@@ -460,7 +473,7 @@ static void q_fmt_table(ray_t* tbl) {
     table_grid(nc, widths, hdr);
     qe_putc('\n');
     grid_rule(nc, widths);
-    qe_putc('\n');
+    if (nr) qe_putc('\n');
     for (int64_t r = 0; r < nr; r++) {
         grid_cells(tbl, nc, widths, mx, r);
         if (r + 1 < nr) qe_putc('\n');
@@ -488,7 +501,7 @@ static void fmt_keyed(ray_t* kt, ray_t* vt) {
     grid_rule(knc, kw);
     qe_putc('|'); qe_putc(' ');
     grid_rule(vnc, vw);
-    qe_putc('\n');
+    if (nr) qe_putc('\n');
     for (int64_t r = 0; r < nr; r++) {
         grid_cells(kt, knc, kw, km, r);
         qe_putc('|'); qe_putc(' ');
@@ -1036,7 +1049,7 @@ static void fmt_into(ray_t* val, char* buf, size_t bufsz, int* trunc) {
     *trunc = t->trunc;
 }
 
-/* Public entry, UNCLIPPED (`string`, `-3!`, CSV, recursive renders). */
+/* Public entry, UNCLIPPED (`string`, CSV, recursive renders, the `-3!` text before q_bang.c cuts it). */
 void q_fmt(ray_t* val, char* buf, size_t bufsz) {
     int trunc;
     fmt_into(val, buf, bufsz, &trunc);
@@ -1430,28 +1443,34 @@ static void fmt_pipe_render(ray_t* val, char* buf, size_t bufsz, int* trunc) {
 }
 
 
-/* The classic console text under the `\c` clip, whatever the display mode. */
-static void fmt_classic_into(ray_t* val, char* buf, size_t bufsz, int* trunc) {
-    *trunc = 0;
-    if (bufsz == 0 || !buf) return;
-    int32_t rows = 0, cols = 0;
-    int armed = q_console_clip(&rows, &cols) && !g_clip_active;
-    if (armed && val && val->type == RAY_LIST && list_is_parse_tree(val, 0))
-        armed = 0;                             /* parse display NEVER clips */
-    if (!armed || rows < 10 || cols < 10 || cols > 2000) {
+/* val under the `\c rows cols` clip: over rows-2 lines ends in a `..` line, a line over cols-1 chars in `..`.  Inside
+ * another clip, or for a parse tree, it renders unclipped. */
+static void fmt_sized_into(ray_t* val, int32_t rows, int32_t cols, char* buf, size_t bufsz, int* trunc) {
+    if (g_clip_active || (val && val->type == RAY_LIST && list_is_parse_tree(val, 0))) {
         fmt_into(val, buf, bufsz, trunc);
         return;
     }
+    *trunc = 0;
+    if (bufsz == 0 || !buf) return;
     g_clip_active = 1;
     g_clip.rows = rows;   g_clip.cols = cols;
     g_clip.nlines = 0;    g_clip.stop = 0;
     g_clip.llen = g_clip.llog = g_clip.ltrail = 0;
+    g_clip.line = g_clip.line0; g_clip.lcap = sizeof g_clip.line0;
     qe_push(buf, bufsz, 1);
     fmt_render(val);
     qe_tgt* t = qe_top();
     qe_pop();
     *trunc = t->trunc;
+    if (g_clip.line != g_clip.line0) free(g_clip.line);
     g_clip_active = 0;
+}
+
+/* The classic console text under the `\c` clip, whatever the display mode. */
+static void fmt_classic_into(ray_t* val, char* buf, size_t bufsz, int* trunc) {
+    int32_t rows = 0, cols = 0;
+    if (!q_console_clip(&rows, &cols) || rows < 10 || cols < 10 || cols > 2000) fmt_into(val, buf, bufsz, trunc);
+    else fmt_sized_into(val, rows, cols, buf, bufsz, trunc);
 }
 
 /* The modern display: tables as the pipe table, everything else as the classic console text. */
@@ -1480,11 +1499,36 @@ void q_fmt_console(ray_t* val, char* buf, size_t bufsz) {
     fmt_console_into(val, buf, bufsz, &trunc);
 }
 
+/* a registry spelling that is a GLYPH (`+`, `%`, `0:`) rather than a keyword —
+ * glyphs take the `:` monadic marker on display, keywords never do */
+static int fn_glyph_spelling(const char* s) {
+    char c = s[0];
+    return !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'));
+}
+
+/* a fn value's provenance spelling, `:` after a monadic glyph when mark is set; 0 when it has none */
+static int fmt_fn_spelling(ray_t* v, int mark) {
+    q_provenance_t pv;
+    if (!q_registry_provenance(v, &pv) || !pv.spelling || !pv.spelling[0]) return 0;
+    qe_puts(pv.spelling);
+    if (mark && pv.valence == Q_MONADIC && fn_glyph_spelling(pv.spelling)) qe_putc(':');
+    return 1;
+}
+
+/* A composition's part: a primitive by its bare spelling, so kdb's `'[not;=]` prints `~=` and `'[neg;abs]` `-abs`
+ * (owner kdb transcript 2026-11-08); anything else as itself. */
+static void fmt_comp_part(ray_t* p) {
+    if (!q_eval_apply_is_fnval(p) || !fmt_fn_spelling(p, 0)) fmt_render(p);
+}
+
+static void fmt_bound_arg(ray_t* a);   /* fwd — over fmt_grow, below */
+
 /* RAY_QFN carrier display over the apply module's read-out accessors (the
  * slot layout stays opaque): lambda = verbatim source, iterator/derived =
- * head + adverb glyph, composition = "u g", projection = verbatim head +
- * the bound-argument echo, holes empty — {x+y}[1;], +[;2] (kdb shape,
- * owner ruling 2026-07-23).  Straight into the emitter: source text is unbounded. */
+ * head + adverb glyph, composition = its parts run together, projection = verbatim head +
+ * the bound-argument echo, holes empty — {x+y}[1;], +[;2] — but never the
+ * rank padding the call did not write: {x+y}[1], 10# is #[10], -8! is ![-8] (owner rulings
+ * 2026-07-23, 2026-11-06 Dyrheb, 2026-11-08).  Straight into the emitter: source text is unbounded. */
 static void carrier_fmt(ray_t* v) {
     q_car_kind_t kind = q_eval_apply_carrier_kind(v);
     if (kind == Q_EVAL_CAR_NONE) return;
@@ -1536,9 +1580,8 @@ static void carrier_fmt(ray_t* v) {
         return;
     }
     case Q_EVAL_CAR_COMP:
-        fmt_render(head);
-        qe_putc(' ');
-        fmt_render(q_eval_apply_comp_inner(v));
+        fmt_comp_part(head);
+        fmt_comp_part(q_eval_apply_comp_inner(v));
         return;
     case Q_EVAL_CAR_NONE: case Q_EVAL_CAR_PROJ: break;
     }
@@ -1546,10 +1589,11 @@ static void carrier_fmt(ray_t* v) {
     else fmt_render(head);
     qe_putc('[');
     int64_t slots = q_eval_apply_proj_nslots(v);
+    while (slots > 0 && !q_eval_apply_proj_arg(v, slots - 1)) slots--;
     for (int64_t i = 0; i < slots; i++) {
         if (i) qe_putc(';');
         ray_t* a = q_eval_apply_proj_arg(v, i);
-        if (a && !Q_IS_HOLE(a)) fmt_render(a);
+        if (a && !Q_IS_HOLE(a)) fmt_bound_arg(a);
     }
     qe_putc(']');
 }
@@ -1560,13 +1604,6 @@ static void fmt_list_elem(ray_t* e) {
     char elem[2048]; elem[0] = '\0';
     q_fmt_krepr(e, elem, sizeof elem);
     qe_puts(elem);
-}
-
-/* a registry spelling that is a GLYPH (`+`, `%`, `0:`) rather than a keyword —
- * glyphs take the `:` monadic marker on display, keywords never do */
-static int fn_glyph_spelling(const char* s) {
-    char c = s[0];
-    return !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'));
 }
 
 static void q_fmt_body(ray_t* val) {
@@ -1595,18 +1632,7 @@ static void q_fmt_body(ray_t* val) {
         return;
     }
 
-    /* RAY_QFN carrier: lambda verbatim source / F+adverb / projection — EXCEPT
-     * that a k PRIMITIVE prints as its glyph whatever machinery implements it
-     * (`%:` is a q.q projection here; kdb still shows `%:` — `.q`reciprocal`,
-     * basics/funsql.md).  Keyword-spelled q.q definitions keep their source. */
     if (val->type == RAY_QFN) {
-        q_provenance_t gpv;
-        if (q_registry_provenance(val, &gpv) && gpv.spelling &&
-            fn_glyph_spelling(gpv.spelling)) {
-            qe_puts(gpv.spelling);
-            if (gpv.valence == Q_MONADIC) qe_putc(':');
-            return;
-        }
         carrier_fmt(val);
         return;
     }
@@ -1678,13 +1704,8 @@ static void q_fmt_body(ray_t* val) {
         val->type == RAY_VARY) {
         /* the paren-list ctor IS kdb's enlist (basics/parsetrees.md fby) */
         if (val == q_registry_list_value()) { qe_puts("enlist"); return; }
-        q_provenance_t pv;
-        if (q_registry_provenance(val, &pv) && pv.spelling && pv.spelling[0]) {
-            qe_puts(pv.spelling);
-            if (pv.valence == Q_MONADIC && fn_glyph_spelling(pv.spelling))
-                qe_putc(':');
-            return;
-        }
+        if (val == q_registry_compose_value()) { qe_putc('\''); return; }
+        if (fmt_fn_spelling(val, 1)) return;
     }
 
     {
@@ -1906,8 +1927,6 @@ static void q_fmt_body(ray_t* val) {
     if (val->type == RAY_LIST) {
         int64_t n = q_count(val);
         ray_t** e = (ray_t**)ray_data(val);
-        /* a bare constructor (parse "()") is the empty-list application */
-        if (n == 1 && e[0] == q_registry_list_value()) { qe_puts("()"); return; }
         if (n == 0) { qe_puts("()"); return; }
         if (q_type_is_row_list(val)) {           /* same-keyed row dicts (a stored table column) print as their table */
             ray_t* tb = q_list_collapse(val);
@@ -2034,7 +2053,7 @@ static void krepr_into(ray_t* val, char* buf, size_t bufsz, int* tr) {
     if (val->type == RAY_LIST) {
         int64_t n = q_count(val);
         ray_t** e = (ray_t**)ray_data(val);
-        if (n == 0 || (n == 1 && e[0] == q_registry_list_value())) {
+        if (n == 0) {
             if ((size_t)snprintf(buf, bufsz, "()") >= bufsz) *tr = 1;
             return;
         }
@@ -2149,4 +2168,63 @@ ray_t* q_fmt_krepr_charv(ray_t* val) {
     ray_t* r = ray_charv(buf, (int64_t)len);
     free(buf);
     return r;
+}
+
+/* A projection's bound argument is an item, one line of k-repr (`{x}[(1;`a)]`), grown like `-3!`: no per-item cap. */
+static void fmt_bound_arg(ray_t* a) {
+    size_t len;
+    char*  buf = a->type == RAY_QFN ? NULL : fmt_grow(fmt_krepr_into, a, &len);
+    if (!buf) { fmt_list_elem(a); return; }
+    qe_putn(buf, len);
+    free(buf);
+}
+
+static RAY_TLS int32_t g_lines_rows, g_lines_cols;   /* fmt_grow passes no context: q_fmt_lines' clip size */
+static RAY_TLS int64_t g_cell_row;                   /* and q_fmt_cells' element */
+
+static void fmt_lines_into(ray_t* val, char* buf, size_t bufsz, int* trunc) {
+    fmt_sized_into(val, g_lines_rows, g_lines_cols, buf, bufsz, trunc);
+}
+
+static void fmt_cell_into(ray_t* vec, char* buf, size_t bufsz, int* trunc) {
+    q_fmt_cell(vec, g_cell_row, 1, buf, bufsz);
+    *trunc = strlen(buf) + 1 >= bufsz;
+}
+
+ray_t* q_fmt_lines(ray_t* val, int64_t rows, int64_t cols) {
+    if (q_fmt_shows_nothing(val)) return ray_list_new(0);
+    int32_t crows = 0, ccols = 0;
+    q_console_clip(&crows, &ccols);
+    g_lines_rows = rows == NULL_I64 ? crows : rows < 1 ? 3 : rows > INT32_MAX - 2 ? INT32_MAX : (int32_t)rows + 2;
+    g_lines_cols = cols == NULL_I64 ? ccols : cols < 2 ? 3 : cols > INT32_MAX - 1 ? INT32_MAX : (int32_t)cols + 1;
+    size_t len;
+    char*  buf = fmt_grow(fmt_lines_into, val, &len);
+    if (!buf) return q_err(QE_WSFULL);
+    ray_t* out = ray_list_new(0);
+    for (size_t at = 0; at <= len && !RAY_IS_ERR(out);) {
+        const char* nl = memchr(buf + at, '\n', len - at);
+        size_t l = nl ? (size_t)(nl - (buf + at)) : len - at;
+        ray_t* s = ray_charv(buf + at, (int64_t)l);
+        out = ray_list_append(out, s);
+        ray_release(s);
+        at += l + 1;
+    }
+    free(buf);
+    return out;
+}
+
+ray_t* q_fmt_cells(ray_t* vec) {
+    int64_t n = q_count(vec);
+    ray_t* out = ray_list_new(n);
+    for (int64_t i = 0; i < n && !RAY_IS_ERR(out); i++) {
+        size_t len;
+        g_cell_row = i;
+        char* cb = fmt_grow(fmt_cell_into, vec, &len);
+        if (!cb) { ray_release(out); return q_err(QE_WSFULL); }
+        ray_t* s = ray_charv(cb, (int64_t)len);
+        free(cb);
+        out = ray_list_append(out, s);
+        ray_release(s);
+    }
+    return out;
 }

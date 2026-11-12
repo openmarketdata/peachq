@@ -10,7 +10,7 @@
 #include <stddef.h>
 
 /* Render val into buf (NUL-terminated, bounded by bufsz), UNCLIPPED.  The
- * round-trippable paths (`string`, `-3!`/`.Q.s1`, CSV) and every recursive
+ * round-trippable paths (`string`, CSV) and every recursive
  * cell/element render use this. */
 void q_fmt(ray_t* val, char* buf, size_t bufsz);
 
@@ -47,6 +47,10 @@ int  q_fmt_prec(void);
 /* A display as a q string ending in the console's line terminator, under the `\c` clip: the classic console text
  * (modern=0, `.Q.s`) or the modern display (modern=1), whatever the session's mode.  Owned, or 'wsfull. */
 ray_t* q_fmt_display_charv(ray_t* val, int modern);
+/* `.Q.S`: val's classic console lines, at most rows of cols chars cut as the console cuts; a null bound is \c's. */
+ray_t* q_fmt_lines(ray_t* val, int64_t rows, int64_t cols);
+/* `.Q.s2` of a vector: one string per element, as its table cell shows it. */
+ray_t* q_fmt_cells(ray_t* vec);
 
 /* Bind `.pq.i.facts` (the pipe digest's per-column facts as strings) and `.pq.i.render_modern` for `\l pq`. */
 void q_fmt_pq_register(void);
@@ -65,7 +69,8 @@ void q_fmt_float(double v, int f32, char* out, size_t n);
  * `,"c"` — the string-model conflation rule); vectors/atoms via q_fmt. */
 void q_fmt_krepr(ray_t* val, char* buf, size_t bufsz);
 
-/* The ALLOCATING twin above, and the one `.Q.s1`/`-3!` body: grows until the whole repr fits.  Owned, or 'wsfull. */
+/* The ALLOCATING twin above: grows until the whole repr fits.  Owned, or 'wsfull.  `-3!`/`0N!`/`.Q.s1` cut it to the
+ * console line in q_bang.c; every other caller gets it whole. */
 ray_t* q_fmt_krepr_charv(ray_t* val);
 
 #endif /* Q_FMT_H */

@@ -13,19 +13,19 @@
 
 #include "qlang/q_count.h"
 #include "qlang/eval/q_eval.h"
+#include "qlang/q_ctx.h"          /* q_ctx_callback_begin — a callback's entry: no stale SIGINT, Ctrl-C live */
 #include "qlang/eval/q_dbg.h"  /* frame list + the error seams (basics/debug.md) */
 #include "qlang/q_prim.h"
 #include "qlang/parse/q_parse.h"  /* q_parse_lang_tree — the char-atom language arm */
 #include "qlang/eval/q_eval_internal.h"
+#include "qlang/eval/q_pattern.h"
 #include "qlang/eval/q_view.h"     /* view carriers apply as their value */
 #include "qlang/eval/q_funsql.h"  /* the `?`/`!` matrix entry points (fnv_matrix_value) */
 #include "qlang/base/q_err.h"
 #include <ctype.h>            /* isalpha — the char-atom language arm */
 #include "qlang/q_ops.h"
-#include "qlang/q_builtins.h"  /* q_builtins_type_num */
 #include "qlang/q_registry.h"
 #include "qlang/base/q_type.h"     /* q_type_is_keyed — the type axis home */
-#include "qlang/parse/q_parse_internal.h"
 #include "qlang/io/q_handles.h"
 #include "qlang/io/q_io.h"     /* q_io_set — Amend Entire `:` on a file target */
 #include "qlang/io/q_kapi.h"   /* q_kapi_invoke — the 112h (`2:`-loaded) arm */
@@ -66,6 +66,15 @@ q_car_kind_t q_eval_apply_carrier_kind(const ray_t* v) {
 
 static ray_t** car_slots(ray_t* c) { return (ray_t**)ray_data(c); }
 
+/* a structure built once is applied many times, so its registry twin is found here rather than per call */
+static ray_t* car_intern(ray_t* c) {
+    ray_t* k = RAY_IS_ERR(c) ? NULL : q_registry_intern_carrier(c, c->aux[0], car_slots(c)[0]);
+    if (!k) return c;
+    ray_release(c);
+    ray_retain(k);
+    return k;
+}
+
 /* manifest rows are static-storage; boxed as an i64 atom slot */
 static ray_t* row_box(const q_op_t* row) {
     return row ? ray_i64((int64_t)(uintptr_t)row) : NULL;
@@ -87,7 +96,9 @@ static ray_t* car_put(ray_t* c, int64_t i, ray_t* child) {
 
 /* lambda carrier: [params symvec, body list, src string, defining `\d` context,
  * declared types i64vec (NULL = undecorated), n name charv, f file sym, l line
- * i64, locals symvec (q_eval_lambda_locals, params excluded)] — 5..7 are the
+ * i64, locals symvec (q_eval_lambda_locals, params excluded), caret table i64vec
+ * (the parser's node -> head-token offset pairs, NULL when none), slot patterns list (a destructured slot's pattern
+ * tree, the generic null on a plain slot; NULL when no slot destructures)] — 5..7 are the
  * ref/value.md provenance slots, NULL until stamped: f/l by the parser
  * (q_eval_apply_lambda_origin), n by the first global assignment
  * (q_eval_apply_lambda_name).
@@ -95,10 +106,15 @@ static ray_t* car_put(ray_t* c, int64_t i, ray_t* child) {
  * globals belong to the namespace it was written in, not the one it is called
  * from (ref/value.md: the globals list of `.test.f` reads `` `test`d`e ``).
  * NULL slot = root. */
-enum { LAM_NAME = 5, LAM_FILE = 6, LAM_LINE = 7, LAM_LOCALS = 8, LAM_SLOTS = 9 };
+enum { LAM_NAME = 5, LAM_FILE = 6, LAM_LINE = 7, LAM_LOCALS = 8, LAM_POS = 9, LAM_PATS = 10, LAM_SLOTS = 11 };
+
+static void lam_local_add(int64_t sym, void* ctx) {
+    ray_t** locals = ctx;
+    if (*locals && !RAY_IS_ERR(*locals) && !q_eval_symvec_has(*locals, sym)) *locals = ray_vec_append(*locals, &sym);
+}
 
 ray_t* q_eval_apply_lambda_new(ray_t* params, ray_t** body, int64_t nbody,
-                               ray_t* src, ray_t* types) {
+                               ray_t* src, ray_t* types, ray_t* pats, ray_t* pos) {
     ray_t* b = ray_list_new(nbody > 0 ? nbody : 1);
     for (int64_t i = 0; i < nbody; i++)
         b = ray_list_append(b, body[i]);
@@ -115,13 +131,24 @@ ray_t* q_eval_apply_lambda_new(ray_t* params, ray_t** body, int64_t nbody,
         ray_retain(types);
         s[4] = types;
     }
+    if (pos) {
+        ray_retain(pos);
+        s[LAM_POS] = pos;
+    }
+    if (pats) {
+        ray_retain(pats);
+        s[LAM_PATS] = pats;
+    }
     int64_t ctx = q_env_scope_ctx();
     if (ctx) c = car_put(c, 3, ray_sym(ctx));
     if (RAY_IS_ERR(c)) return c;
-    return car_put(c, LAM_LOCALS, q_eval_lambda_locals(params, b));
+    ray_t* locals = q_eval_lambda_locals(params, b);
+    for (int64_t i = 0, n = pats ? q_count(pats) : 0; i < n; i++)
+        q_pattern_names(ray_list_get(pats, i), lam_local_add, &locals);
+    return car_put(c, LAM_LOCALS, locals);
 }
 
-static void lam_drop(ray_t* x) {
+static void owned_drop(ray_t* x) {
     if (!x) return;
     if (RAY_IS_ERR(x)) ray_error_free(x); else ray_release(x);
 }
@@ -130,7 +157,7 @@ static void lam_stamp(ray_t* v, const char* name, int64_t nn) {
     ray_t** s = car_slots(v);
     if (s[LAM_NAME]) return;                    /* the FIRST assignment wins */
     ray_t* nm = ray_charv(name, nn);
-    if (!nm || RAY_IS_ERR(nm)) { lam_drop(nm); return; }
+    if (!nm || RAY_IS_ERR(nm)) { owned_drop(nm); return; }
     s[LAM_NAME] = nm;
 }
 
@@ -168,9 +195,13 @@ void q_eval_apply_lambda_origin(ray_t* v, int64_t file_sym, int64_t line) {
     if (s[LAM_FILE]) return;
     ray_t* f = ray_sym(file_sym);
     ray_t* l = ray_i64(line);
-    if (!f || RAY_IS_ERR(f) || !l || RAY_IS_ERR(l)) { lam_drop(f); lam_drop(l); return; }
+    if (!f || RAY_IS_ERR(f) || !l || RAY_IS_ERR(l)) { owned_drop(f); owned_drop(l); return; }
     s[LAM_FILE] = f;
     s[LAM_LINE] = l;
+}
+
+ray_t* q_eval_apply_lambda_pos(ray_t* v) {
+    return q_eval_apply_carrier_kind(v) == Q_EVAL_CAR_LAMBDA ? car_slots(v)[LAM_POS] : NULL;
 }
 
 int q_eval_apply_lambda_prov(ray_t* v, ray_t** name, int64_t* file_sym,
@@ -193,7 +224,7 @@ ray_t* q_eval_apply_deriv_new(int adv, ray_t* fv, const q_op_t* frow) {
         c = car_put(c, 1, row_box(frow));
         if (RAY_IS_ERR(c)) return c;
     }
-    return car_put(c, 2, ray_i64(adv));
+    return car_intern(car_put(c, 2, ray_i64(adv)));
 }
 
 /* kfn carrier: [fn ptr boxed i64, rank i64, lib sym, symbol sym] — a `2:`-loaded C function */
@@ -275,13 +306,13 @@ ray_t* q_eval_apply_proj_new(ray_t* fv, const q_op_t* row, ray_t** args,
         if (args[i]) ray_retain(args[i]);
         s[2 + i] = args[i] ? args[i] : Q_HOLE_OBJ;
     }
-    return c;
+    return car_intern(c);
 }
 
-/* view carrier: [body tree, deps symvec, text charv, cached|NULL]; the
+/* view carrier: [body tree, deps symvec, text charv, cached|NULL, its debug frame|NULL]; the
  * pending/in-recalc flags live in aux[1], owned by q_view.c */
 ray_t* q_eval_apply_view_new(ray_t* body, ray_t* deps, ray_t* text) {
-    ray_t* c = car_new(Q_EVAL_CAR_VIEW, 4);
+    ray_t* c = car_new(Q_EVAL_CAR_VIEW, 5);
     if (RAY_IS_ERR(c)) return c;
     c->aux[1] = 0;
     ray_retain(body); car_slots(c)[0] = body;
@@ -303,7 +334,7 @@ static ray_t* comp_new(ray_t* u, ray_t* g) {
     car_slots(c)[0] = u;
     ray_retain(g);
     car_slots(c)[1] = g;
-    return c;
+    return car_intern(c);
 }
 
 /* ===== small helpers ===================================================== */
@@ -522,10 +553,8 @@ static ray_t* map_unary(ray_unary_fn fn, ray_t* arg) {
         q_eval_apply_store_elem(vec, 0, e0);
         ray_release(e0);
         for (int64_t i = 1; i < len; i++) {
-            if ((i & 0xFFF) == 0 && ray_eval_is_interrupted()) {
-                ray_release(vec);
-                return q_err(QE_STOP);
-            }
+            ray_t* stop = (i & 0xFFF) == 0 && q_eval_interrupt_take() ? q_dbg_stop() : NULL;
+            if (stop) { ray_release(vec); return stop; }
             ray_t* e = q_index_elem_at(arg, i);
             ray_t* r = RAY_IS_ERR(e) ? e : fn(e);
             if (r != e) ray_release(e);
@@ -691,10 +720,8 @@ static ray_t* map_binary(ray_binary_fn fn, const q_op_t* row, ray_t* l, ray_t* r
         q_eval_apply_store_elem(vec, 0, e0);
         ray_release(e0);
         for (int64_t i = 1; i < len; i++) {
-            if ((i & 0xFFF) == 0 && ray_eval_is_interrupted()) {
-                ray_release(vec);
-                return q_err(QE_STOP);
-            }
+            ray_t* stop = (i & 0xFFF) == 0 && q_eval_interrupt_take() ? q_dbg_stop() : NULL;
+            if (stop) { ray_release(vec); return stop; }
             ray_t* a = lc ? q_index_elem_at(l, i) : l;
             ray_t* b = rc ? q_index_elem_at(r, i) : r;
             ray_t* e = (RAY_IS_ERR(a) || RAY_IS_ERR(b)) ? q_err(QE_TYPE)
@@ -779,12 +806,89 @@ static ray_t* gather(ray_t* v, const int64_t* p, int64_t n) {
     return r;
 }
 
+/* The values of keys on one side only (g, consumed): a verb whose fill is null meets as many of the other side's
+ * nulls (its values read past their end, so a table gives null rows of its own columns), another meets its fill
+ * identity where it has one, else g is kept. */
+static ray_t* dict_pair_unmatched(q_eval_zip_fn f, void* ctx, ray_t* id, int nulls, ray_t* other, ray_t* g,
+                                  int g_left) {
+    if (RAY_IS_ERR(g)) return g;
+    ray_t* fill = id;
+    if (nulls) {
+        ray_t* ta[2] = { ray_i64(q_count(g)), ray_i64(q_count(other)) };
+        ray_t* ix = apply_named("#", ta, 2);
+        ray_release(ta[0]);
+        ray_release(ta[1]);
+        fill = RAY_IS_ERR(ix) ? ix : q_index_at(other, &ix, 1);
+        if (!RAY_IS_ERR(ix)) ray_release(ix);
+        if (RAY_IS_ERR(fill)) { ray_release(g); return fill; }
+    }
+    ray_t* r = !fill ? g : g_left ? f(ctx, g, fill) : f(ctx, fill, g);
+    if (fill && fill != id && r != fill) ray_release(fill);
+    if (r != g) ray_release(g);
+    return r;
+}
+
+typedef struct { q_eval_zip_fn f; void* ctx; } swap_ctx;
+
+static ray_t* swap_zip(void* vctx, ray_t* y, ray_t* x) { return ((swap_ctx*)vctx)->f(((swap_ctx*)vctx)->ctx, x, y); }
+
+static ray_t* dict_pair(const q_op_t* row, ray_t* x, ray_t* y, q_eval_zip_fn f, void* ctx, int nulls);
+
+/* keyed table d with the value columns only `other` has added as typed null columns, its own kept as they are:
+ * `key[d]!value[d] uj 0#(cols[o] except cols value d)#o` for o the value of `other` (owned) */
+static ray_t* cols_union(ray_t* d, ray_t* other) {
+    ray_t* v = ray_dict_vals(d);
+    ray_t* o = ray_dict_vals(other);
+    ray_t* ca[2] = { q_cols_fn(o), q_cols_fn(v) };
+    ray_t* miss = RAY_IS_ERR(ca[0]) ? ca[0] : RAY_IS_ERR(ca[1]) ? ca[1] : apply_named("except", ca, 2);
+    for (int i = 0; i < 2; i++) if (ca[i] != miss && !RAY_IS_ERR(ca[i])) ray_release(ca[i]);
+    if (RAY_IS_ERR(miss) || q_count(miss) == 0) {
+        if (RAY_IS_ERR(miss)) return miss;
+        ray_release(miss);
+        ray_retain(d);
+        return d;
+    }
+    ray_t* sa[2] = { miss, o };
+    ray_t* sub = apply_named("#", sa, 2);
+    ray_release(miss);
+    if (RAY_IS_ERR(sub)) return sub;
+    ray_t* zero = ray_i64(0);
+    ray_t* ta[2] = { zero, sub };
+    ray_t* empty = apply_named("#", ta, 2);
+    ray_release(zero);
+    ray_release(sub);
+    if (RAY_IS_ERR(empty)) return empty;
+    ray_t* ua[2] = { v, empty };
+    ray_t* u = apply_named("uj", ua, 2);
+    ray_release(empty);
+    if (RAY_IS_ERR(u)) return u;
+    ray_retain(ray_dict_keys(d));
+    return ray_dict_new(ray_dict_keys(d), u);
+}
+
 /* THE dict-pair law (owner ruling 2026-09-23): the keys align through the index home's one Find
  * (q_index_dict_align) and the verb runs ONCE per aligned group — the shared keys' two gathers, an x-only group
  * against the row's fill identity where it has one (`d1-d2` is 0-y, ref/subtract.md) else kept, a y-only group
- * likewise else appended (ref/divide.md) — then the x half goes back to x's key order by one gather.  `f` sees
+ * likewise else appended (ref/divide.md), a comparison's against the other side's nulls — then the x half goes back
+ * to x's key order by one gather.  A flipping verb runs with y's keys first (x>y is y<x).  `f` sees
  * collections, so a keyed pair's gathered ROWS meet the table law inside it: a keyed table is a dict here. */
 ray_t* q_eval_apply_dict_pair(const q_op_t* row, ray_t* x, ray_t* y, q_eval_zip_fn f, void* ctx) {
+    int nulls = row && q_ops_fill_is_null(row->name);
+    ray_t* cx = nulls && ray_dict_vals(x)->type == RAY_TABLE && ray_dict_vals(y)->type == RAY_TABLE
+                    ? cols_union(x, y) : NULL;
+    ray_t* cy = cx && !RAY_IS_ERR(cx) ? cols_union(y, x) : NULL;
+    if (cx && RAY_IS_ERR(cx)) return cx;
+    if (cy && RAY_IS_ERR(cy)) { ray_release(cx); return cy; }
+    ray_t* ux = cx ? cx : x;
+    ray_t* uy = cy ? cy : y;
+    ray_t* r = row && q_ops_pair_flips(row->name) ? dict_pair(row, uy, ux, swap_zip, &(swap_ctx){ f, ctx }, nulls)
+                                                   : dict_pair(row, ux, uy, f, ctx, nulls);
+    if (cx) ray_release(cx);
+    if (cy) ray_release(cy);
+    return r;
+}
+
+static ray_t* dict_pair(const q_op_t* row, ray_t* x, ray_t* y, q_eval_zip_fn f, void* ctx, int nulls) {
     ray_t* xk = ray_dict_keys(x); ray_t* xv = ray_dict_vals(x);
     ray_t* yk = ray_dict_keys(y); ray_t* yv = ray_dict_vals(y);
     ray_t* al = q_index_dict_align(x, yk);
@@ -809,16 +913,12 @@ ray_t* q_eval_apply_dict_pair(const q_op_t* row, ray_t* x, ray_t* y, q_eval_zip_
         if (gy && part != gy) ray_release(gy);
     }
     if (!same && nh < nx && (!part || !RAY_IS_ERR(part))) {
-        ray_t* gx = gather(xv, xo, nx - nh);
-        ray_t* g = id && !RAY_IS_ERR(gx) ? f(ctx, gx, id) : gx;
-        if (g != gx) ray_release(gx);
+        ray_t* g = dict_pair_unmatched(f, ctx, id, nulls, yv, gather(xv, xo, nx - nh), 1);
         part = part ? join_owned(part, g) : g;
         if (nh > 0 && !RAY_IS_ERR(part)) { ray_t* o = gather(part, perm, nx); ray_release(part); part = o; }
     }
     if (n > nx && (!part || !RAY_IS_ERR(part))) {
-        ray_t* gy = gather(yv, iy + nx, n - nx);
-        ray_t* g = id && !RAY_IS_ERR(gy) ? f(ctx, id, gy) : gy;
-        if (g != gy) ray_release(gy);
+        ray_t* g = dict_pair_unmatched(f, ctx, id, nulls, xv, gather(yv, iy + nx, n - nx), 0);
         part = part ? join_owned(part, g) : g;
     }
     ray_t* keys = xk;
@@ -847,11 +947,12 @@ static ray_t* atomic2_zip(void* vctx, ray_t* x, ray_t* y) {
 }
 
 /* two tables pair column by column: the dict-pair law over their column dicts, flipped back (`t+t`, owner ruling
- * 2026-09-23); each side's dict is owned here and released once the pair has answered */
+ * 2026-09-23), without the comparisons' null fill and flip, which belong to keyed pairs; each side's dict is owned
+ * here and released once the pair has answered */
 static ray_t* table_pair(const q_op_t* row, ray_t* x, ray_t* y, q_eval_zip_fn f, void* ctx) {
     ray_t* cx = flip_of(x);
     ray_t* cy = RAY_IS_ERR(cx) ? NULL : flip_of(y);
-    ray_t* r = RAY_IS_ERR(cx) ? cx : RAY_IS_ERR(cy) ? cy : q_eval_apply_dict_pair(row, cx, cy, f, ctx);
+    ray_t* r = RAY_IS_ERR(cx) ? cx : RAY_IS_ERR(cy) ? cy : dict_pair(row, cx, cy, f, ctx, 0);
     if (r != cx) ray_release(cx);
     if (cy && r != cy) ray_release(cy);
     return r;
@@ -1223,12 +1324,24 @@ static ray_t* lambda_call(ray_t* lam, ray_t** args, int64_t n) {
         const int64_t* tn = (const int64_t*)ray_data(c[4]);
         int64_t nt = q_count(c[4]);
         for (int64_t i = 0; i < n && i < nt; i++)
-            if (tn[i] && q_builtins_type_num(args[i]) != (int8_t)tn[i])
+            if (tn[i] && !q_pattern_type_ok(args[i], tn[i]))
                 return q_err(QE_TYPE);
+    }
+    /* a destructured slot matches whole before the frame exists; its names are locals, bound once it does */
+    ray_t* binds = NULL;
+    if (c[LAM_PATS]) {
+        binds = ray_list_new(4);
+        if (!binds || RAY_IS_ERR(binds)) return binds ? binds : q_err(QE_OOM);
+        for (int64_t i = 0, np = q_count(c[LAM_PATS]); i < n && i < np; i++) {
+            ray_t* pat = ray_list_get(c[LAM_PATS], i);
+            ray_t* err = RAY_IS_NULL(pat) ? NULL : q_pattern_collect(pat, args[i], &binds);
+            if (err) { ray_release(binds); return err; }
+        }
     }
     /* barrier frame: strictly-local resolution (function-notation.md) —
      * the body sees its params/locals and globals, never a caller frame */
-    if (q_env_frame_push(1) != RAY_OK) return q_err(QE_STACK);
+    if (RAY_UNLIKELY(q_eval_stack_low())) { ray_release(binds); return q_err(QE_LIMIT); }
+    if (q_env_frame_push(1) != RAY_OK) { ray_release(binds); return q_err(QE_STACK); }
     for (int64_t i = 0; i < n; i++) {
         ray_t* p = q_index_elem_at(params, i);          /* sym atom */
         if (p && !RAY_IS_ERR(p)) {
@@ -1244,8 +1357,13 @@ static ray_t* lambda_call(ray_t* lam, ray_t** args, int64_t n) {
         ray_err_t se = e ? q_env_local_set(ray_read_sym(ray_data(locals), i, RAY_SYM, locals->attrs), e)
                          : RAY_ERR_OOM;                                              /* retains */
         if (e) ray_release(e);
-        if (se != RAY_OK) { q_env_frame_pop(); return q_err(QE_WSFULL); }
+        if (se != RAY_OK) { q_env_frame_pop(); ray_release(binds); return q_err(QE_WSFULL); }
     }
+    for (int64_t i = 0, nb = binds ? q_count(binds) : 0; i < nb; i += 2) {
+        ray_t** b = (ray_t**)ray_data(binds);
+        if (q_env_local_set(b[i]->i64, b[i + 1]) != RAY_OK) { q_env_frame_pop(); ray_release(binds); return q_err(QE_WSFULL); }
+    }
+    ray_release(binds);
     g_frame_depth++;
     q_dbg_frame_push(lam);
     /* the body resolves in the namespace the lambda was DEFINED in (q_eval_apply_lambda_new); the session `\d`
@@ -1279,10 +1397,30 @@ static ray_t* lambda_call(ray_t* lam, ray_t** args, int64_t n) {
 
 /* ===== projections ======================================================= */
 
+/* A keyword whose value is a projection keeps its row through partial application (`upsert[`t;]` is kdb's
+ * `.[`t;();,;]`), so once full, the values in the keyword's own holes are its kernel's arguments.  NULL when row
+ * is no such keyword. */
+static ray_t* cover_fill(ray_t* fv, const q_op_t* row, ray_t** merged, int64_t rank) {
+    for (q_valence_t v = Q_MONADIC; v <= Q_DYADIC; v++) {
+        ray_t* k = q_registry_row_kernel_at(row, v);
+        ray_t* cv = q_registry_row_value(row, v);
+        if (!k || q_eval_apply_carrier_kind(cv) != Q_EVAL_CAR_PROJ || car_slots(cv)[0] != fv ||
+            ray_block_len(cv) - 2 != rank)
+            continue;
+        ray_t* ka[2];
+        int64_t nk = 0;
+        for (int64_t i = 0; i < rank; i++)
+            if (slot_open(car_slots(cv)[2 + i]) && nk++ < 2) ka[nk - 1] = merged[i];
+        if (nk == (int64_t)v) return q_eval_apply(k, row, ka, nk);
+    }
+    return NULL;
+}
+
 static ray_t* proj_call(ray_t* proj, ray_t** args, int64_t n) {
     ray_t** c = car_slots(proj);
     ray_t* fv = c[0];
-    const q_op_t* row = row_unbox(c[1]);
+    const q_op_t* row = q_registry_operand_row(proj);
+    if (!row) row = row_unbox(c[1]);
     int64_t rank = ray_block_len(proj) - 2;
     ray_t* merged[APPLY_MAX_ARGS];
     int64_t ai = 0, holes = 0, fn_rank = 0, written = 0;
@@ -1302,7 +1440,8 @@ static ray_t* proj_call(ray_t* proj, ray_t** args, int64_t n) {
             return q_eval_apply_proj_new(proj, NULL, args, n, fn_rank);
         return q_eval_apply_proj_new(fv, row, merged, written, rank);
     }
-    return q_eval_apply(fv, row, merged, rank);
+    ray_t* r = cover_fill(fv, row, merged, rank);
+    return r ? r : q_eval_apply(fv, row, merged, rank);
 }
 
 /* ===== noun-head application ============================================
@@ -1385,16 +1524,22 @@ static int64_t rank_of(ray_t* fv) {
             if (slot_open(car_slots(fv)[2 + i])) holes++;
         return holes;
     }
-    case Q_EVAL_CAR_COMP: return rank_of(car_slots(fv)[1]);
+    case Q_EVAL_CAR_COMP: {                 /* basics/glossary.md "Rank": a vector has rank 1 */
+        ray_t* inner = car_slots(fv)[1];
+        return ray_is_vec(inner) ? 1 : rank_of(inner);
+    }
     case Q_EVAL_CAR_ITER: return 1;  /* exactly one operand */
     case Q_EVAL_CAR_KFN: return car_slots(fv)[KFN_RANK]->i64;   /* `2:` declared it */
     case Q_EVAL_CAR_DERIV: {
         /* ref/maps.md:11-16: Each keeps its operand's rank, `\:` `/:` are binary, `':` is Each Parallel on a unary */
         int adv = (int)car_slots(fv)[2]->i64;
-        ray_t* op = car_slots(fv)[0];
-        if (adv == 0) return op ? rank_of(op) : -1;
         if (adv == 4 || adv == 5) return 2;
-        if (adv == 3 && op && rank_of(op) == 1) return 1;
+        ray_t* op = car_slots(fv)[0];
+        int64_t r = op ? rank_of(op) : -1;
+        if (adv == 0) return r;
+        if (adv == 3 && r == 1) return 1;
+        /* accumulators.md "Ternary values": past two, Over and Scan keep the operand's rank */
+        if ((adv == 1 || adv == 2) && r >= 3) return r;
         return -1;
     }
     case Q_EVAL_CAR_NONE: case Q_EVAL_CAR_VIEW: case Q_EVAL_CAR_FOREIGN: break;
@@ -1403,16 +1548,6 @@ static int64_t rank_of(ray_t* fv) {
 }
 
 int64_t q_eval_apply_rank(ray_t* fv) { return fv ? rank_of(fv) : -1; }
-
-/* `a v g` composes the juxtaposed projection `v[a]` onto g (`0|+`, `1~count@`): the one "project then compose"
- * home; a juxtaposition writes no slot */
-static ray_t* proj_compose(ray_t* fv, const q_op_t* row, ray_t* a, ray_t* g) {
-    ray_t* p = q_eval_apply_proj_new(fv, row, &a, 1, 2);
-    if (RAY_IS_ERR(p)) return p;
-    ray_t* c = comp_new(p, g);
-    ray_release(p);
-    return c;
-}
 
 static ray_t* comp_call(ray_t* comp, ray_t** args, int64_t n) {
     ray_t** c = car_slots(comp);
@@ -1425,8 +1560,11 @@ static ray_t* comp_call(ray_t* comp, ray_t** args, int64_t n) {
 }
 
 /* An iterator value applied to its one operand IS the derived function —
- * `(/)[+]`, `+/` and the literal `(/;+)` are all this one call. */
+ * `(/)[+]`, `+/` and the literal `(/;+)` are all this one call.  `(')` applied to 2+ values composes
+ * as `'[f;ff]` does (ref/compose.md:16-23; qchk qchk_tests.q:238). */
 static ray_t* iter_call(ray_t* it, ray_t** args, int64_t n) {
+    if (n >= 2 && q_eval_apply_iter_id(it) == 0)
+        return q_eval_apply(q_registry_compose_value(), NULL, args, n);
     if (n != 1) return q_err(QE_RANK);
     if (!args[0]) return q_eval_apply_proj_new(it, NULL, args, n, 1);
     const q_op_t* frow = q_eval_apply_is_fnval(args[0])
@@ -1442,7 +1580,8 @@ static ray_t* apply_valence_sibling(ray_t* head, int64_t n, const q_op_t** row);
 
 static ray_t* compose_apply(ray_t** args, int64_t n) {
     if (n < 1) return q_err(QE_RANK);
-    if (!q_eval_apply_is_fn(args[n - 1])) return q_err(QE_TYPE);
+    /* the innermost value may be a list or dict, an applicable value of rank 1 (ref/compose.md:21-23) */
+    if (!q_eval_apply_is_fn(args[n - 1]) && !(n >= 2 && indexable(args[n - 1]))) return q_err(QE_TYPE);
     if (n == 1)
         return q_eval_apply_deriv_new(0, args[0],
                                       q_eval_apply_is_fnval(args[0])
@@ -1584,8 +1723,9 @@ static ray_t* enum_route(ray_t* fv, const q_op_t* row, ray_t** args, int64_t n) 
             ray_t* r = enum_concat(fv, row, args);
             if (r) return r;
         }
-        if (n == 2 && (!strcmp(t, "==") || !strcmp(t, "!=") || !strcmp(t, "in"))) {
-            int op = !strcmp(t, "==") ? 0 : !strcmp(t, "!=") ? 1 : 2;
+        int ne = row == q_ops_find("<>", 2);    /* its target names its parts, not a kernel */
+        if (n == 2 && (!strcmp(t, "==") || ne || !strcmp(t, "in"))) {
+            int op = !strcmp(t, "==") ? 0 : ne ? 1 : 2;
             ray_t* r = enum_cmp_route(fv, row, args, op);
             if (r) return r;
         }
@@ -1615,26 +1755,41 @@ static int hole_args(ray_t* fv, ray_t** args, int64_t n, ray_t** out) {
 
 static ray_t* apply_inner(ray_t* fv, const q_op_t* row, ray_t** args, int64_t n) {
     if (!fv || RAY_IS_ERR(fv)) return q_err(QE_TYPE);
-    if (ray_eval_is_interrupted()) return q_err(QE_STOP);
+    if (q_eval_interrupt_take()) {
+        ray_t* stop = q_dbg_stop();
+        if (stop) return stop;
+    }
     if (n < 0 || n > APPLY_MAX_ARGS) return q_err(QE_RANK);
     ray_t* elided[APPLY_MAX_ARGS];
     if (hole_args(fv, args, n, elided)) args = elided;
 
     q_car_kind_t kind = q_eval_apply_carrier_kind(fv);
+    /* a keyword whose value is a composition or projection runs its row's kernel: recognised by the value, one index
+     * probe (a derived function's is the adverb engine's own, by its operand's mono/mono_scan) */
+    if ((kind == Q_EVAL_CAR_COMP || kind == Q_EVAL_CAR_PROJ) &&
+        (n == 1 || n == 2) && args[0] && args[n - 1]) {
+        q_valence_t val = n == 1 ? Q_MONADIC : Q_DYADIC;
+        const q_op_t* krow = q_registry_row_of(fv, val);
+        ray_t* k = q_registry_row_kernel_at(krow, val);
+        if (k) {
+            fv = k;
+            row = krow;
+            kind = Q_EVAL_CAR_NONE;
+        }
+    }
     switch (kind) {
     case Q_EVAL_CAR_FOREIGN: return q_err(QE_TYPE);   /* 112h, but opaque: never callable */
     case Q_EVAL_CAR_ITER: return iter_call(fv, args, n);
     case Q_EVAL_CAR_PROJ: return proj_call(fv, args, n);
     case Q_EVAL_CAR_DERIV: {
         ray_t** c = car_slots(fv);
+        /* a derived function has its map's rank (ref/maps.md), and any value applied short projects
+         * (basics/application.md); an ambivalent Over/Scan/Each Prior reads -1 and keeps its unary form, and a
+         * data operand is no map (`" "/:` is sv, `0x0\:` vs) */
+        int64_t rank = q_eval_apply_is_fn(c[0]) ? rank_of(fv) : -1;
+        if (rank >= 2 && n < rank) return q_eval_apply_proj_new(fv, NULL, args, n, rank);
         return q_adverb_apply((int)c[2]->i64, c[0], row_unbox(c[1]),
                                    args, n);
-    }
-    case Q_EVAL_CAR_COMP: {
-        /* an elision projects the composition ITSELF; pushed down into the inner value it raised 'type */
-        for (int64_t i = 0; i < n; i++)
-            if (!args[i]) return q_eval_apply_proj_new(fv, NULL, args, n, rank_of(fv));
-        return comp_call(fv, args, n);
     }
     case Q_EVAL_CAR_NONE:
         if (!q_eval_apply_is_fnval(fv)) {
@@ -1643,8 +1798,9 @@ static ray_t* apply_inner(ray_t* fv, const q_op_t* row, ray_t** args, int64_t n)
             return noun_index(fv, args, n);
         }
         break;
-    /* the rank/hole laws below run first for these */
-    case Q_EVAL_CAR_LAMBDA: case Q_EVAL_CAR_KFN: case Q_EVAL_CAR_VIEW: break;
+    /* the rank/hole laws below run first for these; an elided or short composition projects ITSELF (pushed down
+     * into the inner value it raised 'type) */
+    case Q_EVAL_CAR_LAMBDA: case Q_EVAL_CAR_KFN: case Q_EVAL_CAR_VIEW: case Q_EVAL_CAR_COMP: break;
     }
 
     int64_t rank = rank_of(fv), holes = 0;
@@ -1657,6 +1813,7 @@ static ray_t* apply_inner(ray_t* fv, const q_op_t* row, ray_t** args, int64_t n)
     if (fv == q_registry_compose_value()) return compose_apply(args, n);
     if (rank >= 0 && n < rank) return q_eval_apply_proj_new(fv, row, args, n, rank);
     if (rank >= 0 && n > rank) return q_err(QE_RANK);
+    if (kind == Q_EVAL_CAR_COMP) return comp_call(fv, args, n);
     /* a manifest FNV overload matrix applied below its minimum rank PROJECTS
      * like any operator (kdb `?[x]` is `?[x;]`) */
     if (fv->type == RAY_VARY && n < 2 && fnv_matrix_value(fv)) {
@@ -1778,30 +1935,32 @@ static ray_t* apply_inner(ray_t* fv, const q_op_t* row, ray_t** args, int64_t n)
  * fusion) flip; the boundary seams then catch lazy at each observable edge. */
 /* the ONE dispatch exit: the deepest apply to produce an error snapshots the
  * live frames here (and, under `\e 1`, suspends into the debugger) */
+/* a polling kernel — a builtin, never a lambda or a derived function, whose body might have had effects — that saw
+ * the signal bails with its own 'stop or the base's 'stop/'cancel and keeps no partial state */
+static int abandoned(ray_t* fv, ray_t* r) {
+    if (!q_eval_apply_is_fnval(fv) || !RAY_IS_ERR(r)) return 0;
+    const char* c = q_err_class(r);
+    return q_err_is(r, QE_STOP) || (c && !strcmp(c, "cancel")) || (c && !strcmp(c, "stop") && !q_err_is(r, QE_SIGNAL));
+}
+
+/* A kernel that ran through the signal stops here, while its frame is live: resuming keeps what it answered, or
+ * re-runs the application a polling kernel abandoned (its arguments are intact). */
 ray_t* q_eval_apply(ray_t* fv, const q_op_t* row, ray_t** args, int64_t n) {
-    ray_t* r = q_eval_apply_concrete(apply_inner(fv, row, args, n));
-    if (q_splay_fault_pending() && r && !RAY_IS_ERR(r)) {   /* a torn zip block under this apply's read */
-        ray_release(r);
-        r = q_err(QE_CORRUPT);
+    ray_t* r;
+    for (;;) {
+        r = q_eval_apply_concrete(apply_inner(fv, row, args, n));
+        if (q_splay_fault_pending() && r && !RAY_IS_ERR(r)) {   /* a torn zip block under this apply's read */
+            ray_release(r);
+            r = q_err(QE_CORRUPT);
+        }
+        if (!q_eval_interrupt_take()) break;
+        ray_t* stop = q_dbg_stop();
+        if (!stop && !(r && abandoned(fv, r))) break;
+        owned_drop(r);
+        if (stop) { r = stop; break; }
     }
     if (r && RAY_IS_ERR(r)) return q_dbg_filter(r, fv, args, n);
     return r;
-}
-
-/* A TRAIN node (Q_ATTR_TRAIN, parser-marked): the last argument is the tail the syntax defers, so a unary head
- * composes onto it (`first asc@`, `u v w@`) and a noun-headed infix composes its projection (`1~count@`, `0|+`,
- * `(1b;)@-9!`).  THE one composition home: the evaluator carries no value test (composition is syntactic).
- * A variadic derived head's one-argument form IS its unary (`f over g@`, #42); a fixed rank >= 2 projects instead. */
-ray_t* q_eval_apply_train(ray_t* fv, const q_op_t* row, ray_t** args, int64_t n) {
-    ray_t* g = args[n - 1];
-    if (fv && !RAY_IS_ERR(fv) && q_eval_apply_is_fn(fv) && g && q_eval_apply_is_fn(g)) {
-        int64_t rank = rank_of(fv);
-        if (n == 1 && (rank == 1 || (rank < 0 && q_eval_apply_carrier_kind(fv) == Q_EVAL_CAR_DERIV)))
-            return comp_new(fv, g);
-        if (n == 2 && args[0] && (rank == 2 || rank < 0))
-            return proj_compose(fv, row, args[0], g);
-    }
-    return q_eval_apply(fv, row, args, n);
 }
 
 /* ===== the public value-apply seam ======================================= */
@@ -1832,12 +1991,12 @@ static ray_t* apply_valence_sibling(ray_t* head, int64_t n, const q_op_t** row) 
     return head;
 }
 
-ray_t* q_eval_apply_value(ray_t* head, ray_t** args, int64_t n) {
+static ray_t* apply_value(ray_t* head, ray_t** args, int64_t n) {
     if (!head || RAY_IS_ERR(head)) return q_err(QE_TYPE);
     if (q_view_is(head)) {                    /* applying a view applies its value */
         ray_t* dv = q_view_deref_borrowed(head);
         if (RAY_IS_ERR(dv)) return dv;
-        ray_t* r = q_eval_apply_value(dv, args, n);
+        ray_t* r = apply_value(dv, args, n);
         ray_release(dv);
         return r;
     }
@@ -1847,6 +2006,15 @@ ray_t* q_eval_apply_value(ray_t* head, ray_t** args, int64_t n) {
         return q_eval_apply(head, row, args, n);
     }
     return noun_index(head, args, n);
+}
+
+/* nothing in the walker: an event-loop callback (a hook, a timer, a client's handler) — it runs in the callback window */
+ray_t* q_eval_apply_value(ray_t* head, ray_t** args, int64_t n) {
+    if (q_eval_active()) return apply_value(head, args, n);
+    q_ctx_callback_begin();
+    ray_t* r = apply_value(head, args, n);
+    q_ctx_callback_end();
+    return r;
 }
 
 /* A projection of head over args (C NULL = hole) CONSTRUCTED, never applied — the codec's seam: a decoder builds
@@ -1937,7 +2105,7 @@ static ray_t* name_lift(const q_op_t* row, ray_t** args, int64_t n, int dot) {
         return q_err(QE_NYI);
     }
     int64_t id = args[0]->i64;
-    ray_t* cur = q_env_handle_get(id);               /* borrowed, at the session `\d` */
+    ray_t* cur = q_env_handle_peek(id);              /* borrowed, at the session `\d`; a write loads no library */
     int stole = 0;
     if (q_splay_table_path(cur)) return q_err(QE_SPLAY);   /* a mapped global takes no write (kb/splayed-tables.md:350) */
     if (cur && !RAY_IS_ERR(cur)) {
@@ -1955,8 +2123,10 @@ static ray_t* name_lift(const q_op_t* row, ray_t** args, int64_t n, int dot) {
         return q_err(QE_DOMAIN);                     /* not a handle */
     }
     ray_t* y = n == 4 ? args[3] : NULL;
+    int was = q_index_in_place(1);
     ray_t* r = dot ? q_index_amend_dot(cur, args[1], args[2], y)
                    : q_index_amend_at(cur, args[1], args[2], y);
+    q_index_in_place(was);
     if (!r || RAY_IS_ERR(r)) {
         if (stole) q_env_handle_bind(id, cur);       /* restore the binding */
         ray_release(cur);
@@ -2080,6 +2250,9 @@ const char* q_eval_apply_car_head_name(ray_t* v) {
     q_car_kind_t kind = q_eval_apply_carrier_kind(v);
     if (kind != Q_EVAL_CAR_DERIV && kind != Q_EVAL_CAR_PROJ) return NULL;
     const q_op_t* row = row_unbox(car_slots(v)[1]);
+    ray_t* h = car_slots(v)[0];
+    /* a kdb primitive shows its glyph whichever keyword row carries it (`|[1;]`, not `or[1;]`) */
+    if (row && h->type != RAY_QFN && q_registry_kdb_op_of(h, NULL) >= 0) return NULL;
     return row ? row->name : NULL;
 }
 

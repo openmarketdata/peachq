@@ -7,15 +7,16 @@
  * refcount contract: args borrowed, result owned. */
 #include "qlang/q_count.h"
 #include "qlang/eval/q_eval.h"
+#include "qlang/eval/q_dbg.h"   /* q_dbg_stop — an interrupted scan suspends where it stopped */
 #include "qlang/q_prim.h"
 #include "qlang/eval/q_eval_internal.h"
 #include "qlang/base/q_err.h"
 #include "qlang/q_ops.h"       /* q_ops_find + manifest columns + the identity-table accessors */
 #include "qlang/q_registry.h"  /* q_registry_row_of, q_registry_row_kernel */
+#include "qlang/q_registry_internal.h" /* q_flip_wrap, q_join_wrap — Join Each of two empty tables */
 #include "qlang/base/q_type.h"
 #include "qlang/ops/q_index.h" /* q_index_elem_at — the one element accessor */
 #include "qlang/ops/q_dollar.h"
-#include "lang/eval.h"          /* ray_eval_is_interrupted */
 #include "table/dict.h"
 #include <string.h>
 
@@ -307,7 +308,8 @@ static ray_t* acc_float_scan(ray_t* a, ray_t* b, ray_t* c) {
         double* o = (double*)ray_data(out);
         double s = a->f64;
         for (int64_t i = 0; i < len; i++) {
-            if (!(i & 0xffff) && ray_eval_is_interrupted()) { ray_release(out); return q_err(QE_STOP); }
+            ray_t* stop = !(i & 0xffff) && q_eval_interrupt_take() ? q_dbg_stop() : NULL;
+            if (stop) { ray_release(out); return stop; }
             volatile double p = s * bv[bv_vec ? i : 0];   /* no FMA: the lambda rounds x*y first */
             s = cv[i] + p;
             if (__builtin_isnan(s)) s = NULL_F64;   /* the arithmetic kernels' one NaN */
@@ -373,6 +375,20 @@ static ray_t* map_zip_pair(void* c, ray_t* x, ray_t* y) {
     return map_zip(((map_zip_t*)c)->fv, ((map_zip_t*)c)->frow, av, 2, 3);
 }
 
+/* Tables Join Each column-wise (ref/join.md:128), so two empty ones keep both column sets: flip (flip x),flip y */
+static ray_t* join_each_empty(ray_t* x, ray_t* y) {
+    ray_t* fx = q_flip_wrap(x);
+    if (!fx || RAY_IS_ERR(fx)) return fx ? fx : q_err(QE_OOM);
+    ray_t* fy = q_flip_wrap(y);
+    ray_t* d = fy && !RAY_IS_ERR(fy) ? q_join_wrap(fx, fy) : fy;
+    ray_release(fx);
+    if (fy && !RAY_IS_ERR(fy)) ray_release(fy);
+    if (!d || RAY_IS_ERR(d)) return d ? d : q_err(QE_OOM);
+    ray_t* r = q_flip_wrap(d);
+    ray_release(d);
+    return r;
+}
+
 /* Each, Each Left and Each Right are ONE law (ref/maps.md: `x f\:y` is
  * `f[;y] each x`).  `mask` names the ITERATED positions — fixed by the
  * operator, never auto-detected — read at i; every other position is held
@@ -413,8 +429,11 @@ static ray_t* map_zip(ray_t* fv, const q_op_t* frow, ray_t** args, int64_t n,
     int whole = r != NULL;                 /* a whole answer or an error: nothing to re-key */
     if (!r && len < 0) r = q_eval_apply(fv, frow, av, n);
     /* a map is uniform: an empty iterated side returns the GENERIC empty list
-     * without an evaluation — `type (2*')til 0` is 0h, not 7h (ref/maps.md) */
-    if (!r && len == 0) r = ray_list_new(0);
+     * without an evaluation — `type (2*')til 0` is 0h, not 7h (ref/maps.md) — save that tables Join Each
+     * column-wise (uqf test_superbook.q:236; SO 73139865) */
+    int tables = n == 2 && iter == 3 && q_type_is_table(av[0]) && q_type_is_table(av[1]);
+    if (!r && len == 0)
+        r = tables && frow && !strcmp(frow->name, ",") ? join_each_empty(av[0], av[1]) : ray_list_new(0);
     if (!r) {
         ray_t* l = ray_list_new(len);
         ray_t* ev[APPLY_MAX_ARGS];
@@ -485,6 +504,16 @@ static ray_t* prior_each(ray_t* fv, const q_op_t* frow, ray_t* seed, ray_t* x) {
         ray_release(x);
         return r;
     }
+    /* unseeded `:':` IS prev, the unit shift `1 xprev x` (W-EXX-091), detected the same way: prev is a q.q
+     * builtin, so it keeps no manifest row */
+    if (!seed && frow && strcmp(frow->name, ":") == 0) {
+        const q_op_t* xrow = q_ops_find("xprev", 5);
+        ray_t* av[2] = { ray_i64(1), x };
+        ray_t* r = q_eval_apply(q_registry_row_value(xrow, Q_DYADIC), xrow, av, 2);
+        ray_release(av[0]);
+        ray_release(x);
+        return r;
+    }
     ray_t* prev = seed;
     if (prev) ray_retain(prev);
     else {
@@ -512,11 +541,13 @@ static ray_t* prior_each(ray_t* fv, const q_op_t* frow, ray_t* seed, ray_t* x) {
         r = q_eval_apply(fv, frow, av, 2);
     } else {
         int64_t len = q_count(x);
+        /* unseeded `~':` never matches its first item (ref/differ.md:19); the typed-null seed would match a leading 0b or null */
+        bool lead_miss = !seed && frow && strcmp(frow->name, "~") == 0;
         ray_t* l = ray_list_new(len);
         for (int64_t i = 0; i < len; i++) {
             ray_t* cur = q_index_elem_at(x, i);
             ray_t* av[2] = { cur, prev };
-            ray_t* e = q_eval_apply_concrete(q_eval_apply(fv, frow, av, 2));
+            ray_t* e = i == 0 && lead_miss ? ray_bool(false) : q_eval_apply_concrete(q_eval_apply(fv, frow, av, 2));
             ray_release(prev);
             prev = cur;
             if (RAY_IS_ERR(e)) { ray_release(l); l = e; break; }

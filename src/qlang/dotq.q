@@ -8,6 +8,11 @@
 .Q.ty:.Q.c.ty;
 .Q.qt:.Q.c.qt;
 .Q.qp:.Q.c.qp;
+/ wp/permissions .h.jx, kdb-common util.q:118-120 (a modified .Q.s): x's console lines within (rows;cols), from row j
+.Q.S:{[b;j;x].Q.c.S[b;$[(j>0)&type[x]within 0 99;j _ x;x]]};
+/ kdb-q-ext-vscode src/format/console.ts:66-84 (a port of q's .Q.s2): uncut, a simple vector's elements as cells;
+/ an atom answers the cell it gets as an element (owner 2026-11-09)
+.Q.s2:{$[type[x]within 1 19;.Q.c.cells x;neg[type x]within 1 19;first .Q.c.cells enlist x;.Q.S[0W 0W;0]x]};
 .Q.s:.Q.c.s;
 .Q.w:.Q.c.w;
 .Q.gc:.Q.c.gc;
@@ -15,6 +20,10 @@
 .Q.trpd:.Q.c.trpd;
 .Q.sbt:.Q.c.sbt;
 .Q.bt:.Q.c.bt;
+.Q.Ll:.Q.c.Ll;
+.Q.btx:.Q.c.btx;
+/ kb/profiler.md: true for a file name that holds system and built-in functions - peachq's embedded library members
+.Q.fqk:{x like "qlib/*"};
 / .Q.btoa/.Q.sha1: the bang is the single C home (`-32!`/`-33!`); delegate here so a user rebind never touches the bang.
 .Q.btoa:-32!;
 .Q.atob:.Q.c.atob;
@@ -26,6 +35,7 @@
 .Q.res:.Q.c.res;
 .Q.hg:.Q.c.hg;
 .Q.hp:.Q.c.hp;
+.Q.ld:{r:.Q.c.ld "\n" sv x;r[;iasc r 0]};
 / .Q.gz/.Q.ts: the bang is the single C home (`-35!`/`-34!`, the q.k spellings); .Q.ts packs Apply's two args.
 .Q.gz:-35!;
 .Q.ts:{-34!(x;y)};

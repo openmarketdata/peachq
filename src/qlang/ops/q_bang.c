@@ -12,7 +12,8 @@
 #include "qlang/ops/q_bang.h"
 #include "qlang/base/q_err.h"
 #include "qlang/q_registry_internal.h"  /* q_hsym_wrap, q_attr_wrap, q_type_strict_i64,
-                                         * q_type_is_int_atom, q_type_iatom_val, q_table_flatten */
+                                         * q_type_is_int_atom, q_type_iatom_val, q_table_flatten,
+                                         * q_mmu_class/q_math_numeric_matrix/q_lsq_wrap (lsq) */
 #include "qlang/q_builtins.h"   /* q_parse_builtin_fn, q_tokens_fn, q_md5_fn, q_dotq_btoa_fn, q_dotq_sha1_fn */
 #include "qlang/q_env.h"        /* q_env_set — the one global-set home (`N!`name`) */
 #include "qlang/ops/q_table.h"  /* q_table_operand — a table by value or by name */
@@ -24,8 +25,8 @@
 #include "qlang/io/q_log.h"         /* q_log_replay — `-11!` streaming execute */
 #include "qlang/eval/q_eval.h"  /* q_eval — `-6!` (internal.md: eval) */
 #include "qlang/eval/q_dbg.h"   /* q_dbg_trp_dot — `-105!` */
-#include "qlang/q_fmt.h"        /* q_fmt_krepr — `-3!`, .Q.s1 */
-#include "qlang/q_console.h"    /* q_console_write — 0N! */
+#include "qlang/q_fmt.h"        /* q_fmt_krepr_charv — the `-3!` / 0N! / .Q.s1 text */
+#include "qlang/q_console.h"    /* q_console_write — 0N!; q_console_clip — the `-3!` cut */
 #include "qlang/ops/q_sys.h"        /* q_sys_ts_apply — `-34!` (.Q.ts) */
 #include "qlang/net/q_net.h"   /* q_net_host / q_net_addr — `-12!`/`-13!` */
 #include "qlang/net/q_tls.h"   /* q_tls_info — `-26!` */
@@ -244,13 +245,25 @@ static ray_t* bang_make_dict(ray_t* x, ray_t* y) {
 }
 
 
+/* `-3!x` (= `.Q.s1`, = what `0N!` prints): the single-line k-repr cut like a console line — past cols-1 chars it
+ * keeps cols-3 and ends `..`, at the width the console renders with (basics/internal.md:16; owner 2026-11-08). */
+static ray_t* bang_s1(ray_t* y) {
+    ray_t* r = q_fmt_krepr_charv(y);
+    int32_t cols;
+    if (RAY_IS_ERR(r) || !q_console_clip(NULL, &cols) || q_count(r) <= cols - 1) return r;
+    ray_t* cut = ray_charv((const char*)ray_data(r), cols - 1);
+    ray_release(r);
+    if (!RAY_IS_ERR(cut)) memcpy((char*)ray_data(cut) + cols - 3, "..", 2);
+    return cut;
+}
+
 /* `0N!x` — debug print: write x's single-line k-repr to the console sink and pass
  * x through unchanged (ref/display.md; file-text.md pins the repr).  Borrowed y in,
  * OWNED y out — the retain balances the caller's release of the result.  The
  * generic null prints nothing, yet `()` prints `()` (peachq#73). */
 static ray_t* bang_show(ray_t* y) {
     if (!Q_IS_GENERIC_NULL(y)) {
-        ray_t* s = q_fmt_krepr_charv(y);      /* `0N!` and `-3!` are ONE text — so, one call */
+        ray_t* s = bang_s1(y);                /* `0N!` and `-3!` are ONE text — so, one call */
         if (RAY_IS_ERR(s)) return s;
         int rc = q_console_write((const char*)ray_data(s), (size_t) q_count(s), true);
         ray_release(s);
@@ -271,10 +284,15 @@ ray_t* q_bang_dispatch(int64_t id, ray_t* y) {
         case NULL_I64: return bang_show(y);   /* 0N!x — debug print, pass through */
         case -1:  return q_hsym_wrap(y);
         case -2:  return q_attr_wrap(y);
-        case -3:  return q_fmt_krepr_charv(y);
+        case -3:  return bang_s1(y);
         case -4:  return q_tokens_fn(y);
         case -5:  return q_parse_builtin_fn(y);
-        case -6:  return q_eval(y);              /* internal.md: -6! is eval */
+        case -6: {   /* internal.md: -6! is eval; a tree's names are handles, so they resolve at the session `\d` */
+            int64_t scope = q_env_scope(Q_ENV_SCOPE_SESSION);
+            ray_t* r = q_eval(y);
+            q_env_scope(scope);
+            return r;
+        }
         case -7:  return h_hcount(y);
         case -8:  return q_wire_serialize(y, Q_WIRE_ASYNC);
         case -22: return q_wire_serialize_len(y);
@@ -354,5 +372,12 @@ ray_t* q_bang(ray_t* x, ray_t* y) {
             return q_enum_ref(x->i64, y);
         return q_err(QE_TYPE);
     }
+    /* kdb writes lsq as `!`: two float matrixes solve, and two numeric ones that could never pair as a dict are
+     * lsq's own 'type (ref/lsq.md: matrix functions work on floats) */
+    int64_t w;
+    int xc = q_mmu_class(x, &w), yc = q_mmu_class(y, &w);
+    if (((xc == 1 || xc == QMMU_RAGGED) && (yc == 1 || yc == QMMU_RAGGED)) ||
+        (q_count(x) != q_count(y) && q_math_numeric_matrix(x) && q_math_numeric_matrix(y)))
+        return q_lsq_wrap(x, y);
     return bang_make_dict(x, y);
 }

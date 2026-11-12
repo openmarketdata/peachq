@@ -18,6 +18,7 @@
  *
  * Requires an initialised rayforce runtime (symbol interning). */
 ray_t* q_parse(const char* src);
+ray_t* q_parse_at(const char* src, ray_t** pos);   /* + the statement's OWNED caret table (node; offset) i64 pairs */
 
 /* `(.X.e; "text")` application tree (`q` -> `value`) — the language-handler
  * dispatch q_parse applies to a `<letter>)` prefix, shared with the char-atom
@@ -40,6 +41,18 @@ int q_parse_is_assign(const ray_t* ast);
  * its TSV harness) — the eval path keeps the raw C-NULL slots, which encode
  * "no-op statement, no output".  No-op on any other tree shape. */
 void q_ast_fill_empty_stmts(ray_t* ast);
+
+/* THE assignment-target classifier both parser and evaluator ask; PATTERN is kdb 4.1's (basics/pattern.md). */
+typedef enum { Q_TARGET_NONE, Q_TARGET_NAME, Q_TARGET_INDEX, Q_TARGET_PATTERN } q_assign_target_t;
+q_assign_target_t q_parse_assign_target(const ray_t* lhs);
+
+/* THE assignment-head classifier, on a node's head VALUE: `:` assigns, identity `::` assigns the global, and a unary
+ * primitive below kdb code 20 (`+:` … `.:`) assigns through its glyph, whose dyadic value and row it hands back
+ * (borrowed; either out may be NULL); `<>:` `<=:` `>=:`, which have no unary value, keep their marked symbol.
+ * The control words `if` `do` `while` stay symbols and are no head here. */
+typedef enum { Q_HEAD_NONE, Q_HEAD_ASSIGN, Q_HEAD_GLOBAL, Q_HEAD_THROUGH } q_assign_head_t;
+struct q_op;
+q_assign_head_t q_parse_assign_head(const ray_t* h, ray_t** op, const struct q_op** row);
 
 /* True iff h is the statement-sequence HEAD — the char ";" (-10h), not a
  * symbol.  THE one test; q_eval's head dispatch and the parser both ask it. */

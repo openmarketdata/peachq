@@ -174,14 +174,19 @@ ray_t* q_table_row_at(ray_t* t, int64_t row) {
                 cell = ((ray_t**)ray_data(col))[row];
                 ray_retain(cell);
             } else {
-                /* miss: the null of the first item's type (doc law); a string
-                 * item nulls to the empty string, non-atom items to :: */
+                /* miss: the index miss law, which builds no null for a STR-atom item (a string): that is the empty
+                 * string; a () column has no item type, so its row reads as atoms (::), the join-rank convention */
                 ray_t** e = (ray_t**)ray_data(col);
-                if (q_count(col) > 0 && e[0] && e[0]->type == -RAY_STR)
+                if (q_count(col) == 0) {
+                    ray_retain(RAY_NULL_OBJ);
+                    cell = RAY_NULL_OBJ;
+                } else if (e[0] && e[0]->type == -RAY_STR) {
                     cell = ray_str("", 0);
-                else if (q_count(col) > 0 && e[0] && e[0]->type < 0)
-                    cell = ray_typed_null(e[0]->type);
-                else { ray_retain(RAY_NULL_OBJ); cell = RAY_NULL_OBJ; }
+                } else {
+                    ray_t* ix = ray_i64(nr);
+                    cell = q_index_at(col, &ix, 1);
+                    ray_release(ix);
+                }
             }
         } else if (col) {                                    /* typed vector: ray_at null-fills a miss */
             cell = q_join_item(col, row);
@@ -380,6 +385,17 @@ static ray_t* null_cell_like(ray_t* col) {
     return cell;
 }
 
+int q_table_is_cell(ray_t* col, ray_t* v) {
+    if (ray_is_atom(v) && !q_type_is_str_atom(v)) return 1;
+    if (col->type == RAY_TABLE) return q_type_is_plain_dict(v);
+    if (col->type != RAY_LIST && col->type != RAY_STR) return 0;
+    if (q_count(col) == 0) return -1;
+    ray_t* e = q_index_elem_at(col, 0);
+    int r = e && !RAY_IS_ERR(e) && q_index_rank(v) <= q_index_rank(e);
+    if (e) ray_release(e);
+    return r;
+}
+
 /* Normalize an insert/upsert/Join payload y against the FLAT target schema.
  * Returns an OWNED plain table with the target's column names holding the
  * new rows.  Forms (ref/insert.md, ref/upsert.md, ref/join.md):
@@ -387,13 +403,17 @@ static ray_t* null_cell_like(ray_t* col) {
  *     to the target -> 'mismatch (silent drop is never OK).  Target columns
  *     absent from the payload: null-filled under Q_ROWS_JOIN, else
  *     'mismatch (insert).
- *   - LIST, insert law: a first-item ATOM makes y ONE record (owner ruling
- *     2026-09-16: `(1i;`x`y)` is a row, TorQ checkmonitor.q:45); otherwise
+ *   - Both list laws read y as ONE record when its first item that can tell
+ *     is one ITEM of its column (q_table_is_cell): an atom, a string in a
+ *     string column, a dict in a column of dicts.  An empty general column
+ *     cannot tell, so `(`f`g;0Np;0i)` is one row of `([]f:();p:`timestamp$();n:`int$())`.
+ *   - LIST, insert law: such a y is ONE record (owner ruling 2026-09-16:
+ *     `(1i;`x`y)` is a row, TorQ checkmonitor.q:45); otherwise
  *     count == ncols with the list items of one count is the columns-form
  *     (ref/insert.md:63 `(`s`t;40 50)`), an atom item broadcast to that count.
  *   - LIST/vector, Join law: row-major under the ref/join.md:192 rank rule —
- *     a first-element ATOM makes y rank 1, one below the table's 2, so y is
- *     implicitly enlisted as a single record; otherwise every item is a
+ *     such a y is rank 1, one below the table's 2, so it is implicitly
+ *     enlisted as a single record; otherwise every item is a
  *     record.  NEVER column-major: `a,:(`a`b;1 2)` is two ROWS (peachq#26).
  *   - other LIST: records-form — every item a list/vector of ncols cells.
  *   - DICT: one row, name-matched: a key naming no column is 'mismatch
@@ -489,13 +509,15 @@ ray_t* q_table_rows_normalize(ray_t* flat, ray_t* y, int law) {
         return q_err(QE_TYPE);
 
     int64_t ny = q_count(y);
-    int single = 0;
-    if (ny > 0) {
-        ray_t* f0 = q_join_item(y, 0);
-        if (!f0 || RAY_IS_ERR(f0)) return f0 ? f0 : q_err(QE_OOM);
-        single = ray_is_atom(f0);
-        ray_release(f0);
+    /* the rank rule read at the first column that decides it: an empty general column has no item rank */
+    int single = -1;
+    for (int64_t c = 0; c < ny && c < nc && single < 0; c++) {
+        ray_t* f = q_join_item(y, c);
+        if (!f || RAY_IS_ERR(f)) return f ? f : q_err(QE_OOM);
+        single = q_table_is_cell(ray_table_get_col_idx(flat, c), f);
+        ray_release(f);
     }
+    single = single > 0;
 
     /* columns-form; an atom item broadcasts because TorQ's updtab stamps a .u.upd atom row as a 1-vector time
      * followed by atoms and stplog.q:73 inserts it (owner ruling 2026-09-18) */
@@ -1063,13 +1085,14 @@ ray_t* q_ungroup_wrap(ray_t* x) {
     if (!flat || RAY_IS_ERR(flat)) return flat;
     int64_t nc = ray_table_ncols(flat);
     int64_t nr = q_count(flat);
-    if (nc > 64) { ray_release(flat); return q_err(QE_LIMIT); }
-    ray_t* acc[64];
+    ray_t** acc = malloc((size_t)(nc > 0 ? nc : 1) * sizeof *acc);
+    if (!acc) { ray_release(flat); return q_err(QE_OOM); }
     for (int64_t c = 0; c < nc; c++) {
         acc[c] = ray_list_new(nr > 0 ? nr : 1);
         if (RAY_IS_ERR(acc[c])) {
             ray_t* err = acc[c];
             for (int64_t j = 0; j < c; j++) ray_release(acc[j]);
+            free(acc);
             ray_release(flat);
             return err;
         }
@@ -1116,10 +1139,12 @@ ray_t* q_ungroup_wrap(ray_t* x) {
     if (err) {
         for (int64_t c = 0; c < nc; c++)
             if (acc[c] && !RAY_IS_ERR(acc[c])) ray_release(acc[c]);
+        free(acc);
         ray_release(flat);
         return err;
     }
     ray_t* out = q_table_cols_from_accs((const int64_t*)ray_data(ray_table_schema(flat)), acc, nc, rows_col);
+    free(acc);
     ray_release(flat);
     return out;
 }

@@ -2,9 +2,9 @@
 #include "qlang/q_count.h"
 #include "qlang/ops/q_key.h"
 #include "qlang/base/q_err.h"
-#include "qlang/q_env.h"              /* q_env_handle_resolve / _ns_roster / _marker_sym */
+#include "qlang/q_env.h"              /* q_env_handle_resolve / _ns_roster */
 #include "qlang/base/q_type.h"             /* q_type_qname + the is_dict/is_str_atom/is_keyed probes */
-#include "qlang/q_registry_internal.h" /* q_til_wrap — the til arm */
+#include "qlang/q_registry_internal.h" /* q_til_wrap — the til arm; q_mmu_class/q_inv_wrap — the inv arm */
 #include "qlang/ops/q_table.h"        /* q_table_operand — `keys` takes a table by name */
 #include "qlang/io/q_provider.h"      /* q_provider_key — a `:pq:` alias lists its tables, a coordinate its columns */
 #include "lang/internal.h"            /* ray_fs_list_fn — the quarry's sorted directory listing */
@@ -63,7 +63,6 @@ ray_t* q_key_name(int64_t sym) {
         ray_release(s);
         return ray_list_new(1);
     }
-    int is_root = (l == 1 && nm[0] == '.');
     ray_release(s);
     ray_t* v = q_env_handle_resolve(sym);
     if (!v) return ray_list_new(1);              /* unbound -> () */
@@ -71,19 +70,6 @@ ray_t* q_key_name(int64_t sym) {
     if (!q_type_is_dict(v)) {                    /* bound non-dict -> the name */
         ray_release(v);
         return ray_sym(sym);
-    }
-    /* The root lists OBJECTS only: env marks every namespace dictionary the
-     * same way, but kdb prints that marker for `` `.foo `` and NOT for the
-     * root (ref/key.md `key `.` beside `key `.q`). */
-    if (is_root) {
-        ray_t* marker = ray_sym(q_env_marker_sym());
-        if (!marker || RAY_IS_ERR(marker)) {
-            ray_release(v);
-            return marker ? marker : q_err(QE_WSFULL);
-        }
-        v = ray_dict_remove(v, marker);          /* COW; consumes v */
-        ray_release(marker);
-        if (!v || RAY_IS_ERR(v)) return v ? v : q_err(QE_WSFULL);
     }
     ray_t* k = ray_dict_keys(v);                 /* borrowed */
     if (!k) { ray_release(v); return q_err(QE_TYPE); }
@@ -105,8 +91,8 @@ ray_t* q_key(ray_t* x) {
         const char* nm = q_type_qname(RAY_CHARV);
         return ray_sym(ray_sym_intern_runtime(nm, strlen(nm)));
     }
-    if (q_type_is_int_atom(x) && !RAY_ATOM_IS_NULL(x) && q_type_iatom_val(x) >= 0)
-        return q_til_wrap(x);                    /* key n == til n */
+    if ((q_type_is_int_atom(x) && !RAY_ATOM_IS_NULL(x) && q_type_iatom_val(x) >= 0) || (x && x->type == -RAY_BOOL))
+        return q_til_wrap(x);                    /* key n == til n, and `til 1b` is ,0 (ref/til.md) */
     if (q_type_is_sym_atom(x))
         return q_key_name(x->i64);
     if (!q_type_is_dict(x))                      /* a keyed table IS a dict */
@@ -117,7 +103,12 @@ ray_t* q_key(ray_t* x) {
     return k;
 }
 
-ray_t* q_key_wrap(ray_t* x) { return q_key(x); }
+/* `!:` is also inv: a float matrix, which key refuses, inverts (kdb writes inv as `!:`) */
+ray_t* q_key_wrap(ray_t* x) {
+    int64_t w;
+    int c = q_mmu_class(x, &w);
+    return c == 1 || c == QMMU_RAGGED ? q_inv_wrap(x) : q_key(x);
+}
 
 /* q `keys x` — key column names (empty sym vector if unkeyed; table by value
  * or by name). */

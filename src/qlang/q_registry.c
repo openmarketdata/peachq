@@ -17,14 +17,14 @@
  * LOWERING METADATA: each wrapper's rayfall aux-name is set to the CANONICAL
  * rayfall verb it lowers as (== != take drop) and it carries RAY_FN_Q_LOWER
  * (RAY_FN_Q_LOWER, lang/eval.h), so the compiler + query DAG dispatch on that name
- * (q `=`/`<>` hit ray_eq/ray_ne) instead of declining every non-canonical
+ * (q `=` hits ray_eq) instead of declining every non-canonical
  * value head to the eval fallback.  Pass-through/rename values ARE the env
  * builtin object, so they name-route via the existing canonical-identity path.
  *
  * REGISTRY-INIT PRECONDITION (codex #1): value embedding requires an
  * initialised registry, and a registry builder MUST NEVER call q_parse during
  * bootstrap (it would recurse into a not-yet-ready registry).  Builders here
- * only touch ray_env_get / ray_fn_* — never the parser.  A debug re-entry
+ * touch ray_env_get / ray_fn_* and the apply module's compose head — never the parser.  A debug re-entry
  * guard (g_building) marks the bootstrap window and is the seam 2b's
  * parser-flip enforcement extends. */
 #define _POSIX_C_SOURCE 200809L
@@ -32,7 +32,7 @@
 #include "qlang/q_count.h"
 #include "qlang/q_registry_internal.h" /* the split's shared surface — brings qlang/q_registry.h + qlang/q_ops.h */
 #include "qlang/base/q_err.h"
-#include "qlang/q_env.h"   /* q_env_get — q-bound builtins are snapshot sources too; q_env_ns_probe */
+#include "qlang/q_env.h"   /* q_env_get — q-bound builtins are snapshot sources too; q_env_ns_probe/_member */
 #include "lang/env.h"      /* ray_env_get (bootstrap catalogue); ray_fn_unary/binary/vary */
 #include "lang/eval.h"     /* RAY_FN_ATOMIC/SPECIAL_FORM/Q_LOWER — attrs stamped on built values */
 #include "lang/internal.h" /* ray_sym_str — name display */
@@ -40,6 +40,7 @@
 #include "store/serde.h"   /* ray_serde_set_fn_hooks — fn-value serde round-trip */
 #include "qlang/eval/q_eval.h" /* q_eval_apply_iter_new — the iterator carriers */
 #include "qlang/base/q_type.h"  /* q_type_init — bakes the result-type matrix */
+#include "qlang/q_prim.h"       /* q_match_rec — carrier interning */
 #include <assert.h>
 #include <stdint.h>        /* INT64_MAX */
 #include <stdio.h>         /* snprintf */
@@ -50,7 +51,8 @@ typedef struct {
     int64_t     sym_id;
     q_valence_t valence;
     ray_t*      value;       /* owned (rc>=1) */
-    ray_t*      kernel;      /* QR_COVER: the owned unary C kernel under the extension; else NULL */
+    ray_t*      kernel;      /* a cover or QR_COMP2 cell: the owned C kernel under the structured value; else NULL */
+    const q_recipe_t* recipe; /* the cell this entry was built from */
     const q_op_t* row;       /* the manifest row this entry was built from */
     /* provenance */
     const char* spelling;    /* q surface name (static, from the manifest) */
@@ -105,6 +107,12 @@ static const q_op_t* g_ops_base;
 static int           g_ops_n;
 static int16_t       g_row_ent[REG_ROW_CAP][3];
 
+/* the values that are a composition, projection or derived function, by carrier kind, scanned on every such
+ * construction (q_registry_intern_carrier): head is the primitive at slot 0, which a match must share, else NULL */
+typedef struct { ray_t* value; ray_t* head; } car_ent_t;
+static car_ent_t g_car[Q_EVAL_CAR_COMP + 1][REG_ROW_CAP];
+static int       g_car_n[Q_EVAL_CAR_COMP + 1];
+
 static size_t idx_hash(uint64_t k, size_t mask) {
     return (size_t)((k * 0x9E3779B97F4A7C15ull) >> 32) & mask;
 }
@@ -125,8 +133,7 @@ static sym_slot_t* sym_slot(int64_t sym_id, int insert) {
     }
 }
 
-/* a name with no manifest row holds a valueless slot: a syntax word is reserved in every spelling, a q.q-defined
- * `.q` name only as a global (q_registry_locked) — a local or another context's member may reuse it */
+/* a name with no manifest row holds a valueless slot: a syntax word, or a q.q-defined `.q` name once sealed */
 static const q_op_t SYNTAX_WORD, DOTQ_BUILTIN;
 static void reserve_name(int64_t sym_id, const q_op_t* mark) {
     sym_slot_t* s = sym_slot(sym_id, 1);
@@ -151,13 +158,15 @@ static val_slot_t* val_slot(const ray_t* value, q_valence_t valence, int insert)
 }
 
 /* Two rows can share one value at one valence (`reverse` and `|`-monadic are one
- * env object).  A two-valence row's `family` describes its DYAD, so it is the wrong
- * answer for the other valence: prefer the row that has no recipe at that other
- * valence, and only a pair with no such winner stays undecidable. */
+ * env object; `$` and `mmu` one primitive).  A two-valence row's `family` describes
+ * its DYAD, so it is the wrong answer for the monad and the right one for the dyad:
+ * the monad prefers the row with no dyad, the dyad the row with both, and only a
+ * pair with no such winner stays undecidable. */
 static const q_op_t* row_prefer(const q_op_t* a, const q_op_t* b, q_valence_t v) {
-    int a1 = (v == Q_MONADIC) ? a->dyad.kind == QK_NONE : a->mon.kind == QK_NONE;
-    int b1 = (v == Q_MONADIC) ? b->dyad.kind == QK_NONE : b->mon.kind == QK_NONE;
-    return a1 == b1 ? NULL : (a1 ? a : b);
+    int a2 = a->mon.kind != QK_NONE && a->dyad.kind != QK_NONE;
+    int b2 = b->mon.kind != QK_NONE && b->dyad.kind != QK_NONE;
+    if (a2 == b2) return NULL;
+    return (v == Q_DYADIC) == (a2 != 0) ? a : b;
 }
 
 /* Register g_entries[idx] in every index.  The sharing verdict is a static
@@ -179,6 +188,11 @@ static void idx_add_entry(int idx) {
     }
     ptrdiff_t r = e->row - g_ops_base;
     if (r >= 0 && r < g_ops_n) g_row_ent[r][e->valence] = (int16_t)idx;
+    q_car_kind_t k = q_eval_apply_carrier_kind(e->value);
+    if (!e->alias_of && (k == Q_EVAL_CAR_COMP || k == Q_EVAL_CAR_PROJ || k == Q_EVAL_CAR_DERIV)) {
+        ray_t* h = q_eval_apply_car_head(e->value);
+        g_car[k][g_car_n[k]++] = (car_ent_t){ e->value, q_eval_apply_is_fnval(h) ? h : NULL };
+    }
 }
 
 /* The built entry for (row, valence), or NULL — the one read of g_row_ent. */
@@ -196,6 +210,7 @@ static void idx_reset(void) {
     memset(g_val_idx, 0, sizeof g_val_idx);
     memset(g_row_ent, 0xFF, sizeof g_row_ent);   /* -1 fill */
     g_sym_used = g_val_used = 0;
+    memset(g_car_n, 0, sizeof g_car_n);
     g_ops_base = NULL;
     g_ops_n    = 0;
 }
@@ -366,6 +381,38 @@ static ray_t* build_wrapper(const q_recipe_t* r) {
     }
 }
 
+static int recipe_same(const q_recipe_t* a, const q_recipe_t* b) {
+    return a->kind == b->kind && a->fn == b->fn && a->arity == b->arity && a->atomic == b->atomic &&
+           (a->target == b->target || (a->target && b->target && strcmp(a->target, b->target) == 0));
+}
+
+static const entry_t* code_entry(int code, q_valence_t valence) {
+    int n = 0;
+    const q_op_t* ops = q_ops_table(&n);
+    for (int i = 0; code >= 0 && i < n; i++) {
+        const entry_t* e = q_ops_kdb_op(&ops[i]) == code ? row_entry(&ops[i], valence) : NULL;
+        if (e) return e;
+    }
+    return NULL;
+}
+
+/* Append and index one entry owning val (and kernel); tgt is the row a QK_ALIAS cell shares, else NULL. */
+static void push_entry(const q_op_t* op, q_valence_t valence, const q_recipe_t* r, int64_t sym_id, ray_t* val,
+                       ray_t* kernel, const entry_t* tgt) {
+    entry_t* e    = &g_entries[g_count++];
+    e->sym_id     = sym_id;
+    e->valence    = valence;
+    e->value      = val;
+    e->kernel     = kernel;
+    e->recipe     = r;
+    e->row        = op;
+    e->spelling   = op->name;
+    e->lower_name = tgt ? tgt->lower_name : r->target;  /* rayfall routing name */
+    e->is_wrapper = tgt ? tgt->is_wrapper : (r->kind != QK_ENV);
+    e->alias_of   = tgt ? tgt->row : NULL;
+    idx_add_entry(g_count - 1);
+}
+
 /* Record one (name, valence) entry.  Returns RAY_OK, or RAY_ERR_DOMAIN if the
  * builder produced NULL/err for a non-QR_NONE recipe (audited source missing). */
 static ray_err_t add_entry(const q_op_t* op, q_valence_t valence,
@@ -379,27 +426,58 @@ static ray_err_t add_entry(const q_op_t* op, q_valence_t valence,
     if (r->kind == QK_QSRC) return RAY_OK;              /* value comes from q.q —
                                                          * installed post-bootstrap
                                                          * by q_registry_bind_qsrc */
+    if (r->kind == QK_COMP) return RAY_OK;              /* built by add_comp once
+                                                         * every row is       */
     /* QK_ALIAS shares the target's already-built value, so the target row must
      * come EARLIER in the manifest; if it has not been built yet the lookup
      * misses and init fails fast rather than binding a half-built registry. */
     const entry_t* tgt = (r->kind == QK_ALIAS)
         ? row_entry(q_ops_alias_target(op), valence) : NULL;
     if (r->kind == QK_ALIAS && !tgt) return RAY_ERR_DOMAIN;
-    ray_t* val = tgt ? (ray_retain(tgt->value), tgt->value)
+    /* One value per primitive: a row whose kdb code an earlier row already holds at this valence IS that value,
+     * so `neg~(-:)`.  It keeps its own row (the value index prefers it as the one-valence spelling); a recipe that
+     * disagrees with the holder's is a manifest bug. */
+    const entry_t* prim = !tgt ? code_entry(q_ops_kdb_op(op), valence) : NULL;
+    if (prim && !recipe_same(prim->recipe, r)) return RAY_ERR_DOMAIN;
+    const entry_t* src = tgt ? tgt : prim;
+    ray_t* val = src ? (ray_retain(src->value), src->value)
                : (r->kind == QK_ENV) ? build_env(r->target) : build_wrapper(r);
     if (!val || RAY_IS_ERR(val)) return RAY_ERR_DOMAIN; /* fail-fast: audited bug */
-    entry_t* e    = &g_entries[g_count++];
-    e->sym_id     = sym_id;
-    e->valence    = valence;
-    e->value      = val;
-    e->kernel     = NULL;
-    e->row        = op;
-    e->spelling   = op->name;
-    e->lower_name = tgt ? tgt->lower_name : r->target;  /* rayfall routing name */
-    e->is_wrapper = tgt ? tgt->is_wrapper : (r->kind != QK_ENV);
-    e->alias_of   = tgt ? tgt->row : NULL;
-    idx_add_entry(g_count - 1);
+    push_entry(op, valence, r, sym_id, val, NULL, tgt);
     return RAY_OK;
+}
+
+/* A cell whose value is a structure, owned here (a q.q snapshot or a composition), with the kernel its recipe names.
+ * It counts as a wrapper: the value is unique per cell, so pointer-identity provenance is exact
+ * (q_registry_provenance).  Serde is UNTOUCHED by that: the `q!…` fn-hook fires only for RAY_FN_Q_LOWER function
+ * values; carriers keep riding whatever generic carrier serde exists. */
+static ray_err_t add_structure(const q_op_t* op, q_valence_t valence, const q_recipe_t* r, ray_t* val) {
+    /* a primitive is never a structure, and one structure is one row: a duplicate would answer the earlier row */
+    if ((r->fn && q_ops_kdb_op(op) >= 0) ||
+        q_registry_intern_carrier(val, q_eval_apply_carrier_kind(val), q_eval_apply_car_head(val))) {
+        ray_release(val);
+        return RAY_ERR_DOMAIN;
+    }
+    ray_t* kernel = r->fn ? build_wrapper(r) : NULL;
+    if (r->fn && (!kernel || RAY_IS_ERR(kernel))) { ray_release(val); return RAY_ERR_DOMAIN; }
+    push_entry(op, valence, r, ray_sym_intern(op->name, strlen(op->name)), val, kernel, NULL);
+    return RAY_OK;
+}
+
+static ray_err_t add_comp(const q_op_t* op, q_valence_t valence, const q_recipe_t* r) {
+    if (r->kind != QK_COMP) return RAY_OK;
+    ray_t* parts[4];
+    int n = 0;
+    for (const char* p = r->target; *p && n < 4; n++) {
+        const char* sp = strchr(p, ' ');
+        size_t len = sp ? (size_t)(sp - p) : strlen(p);
+        parts[n] = q_registry_lookup_name(p, len, sp ? Q_MONADIC : valence);
+        if (!parts[n]) return RAY_ERR_DOMAIN;
+        p += len + (sp != NULL);
+    }
+    ray_t* val = q_eval_apply_value(g_specials[SPEC_compose], parts, n);
+    if (!val || RAY_IS_ERR(val)) return RAY_ERR_DOMAIN;
+    return add_structure(op, valence, r, val);
 }
 
 /* ---- serde hooks: q wrappers round-trip through the registry -------------
@@ -448,26 +526,6 @@ ray_err_t q_registry_init(void) {
     idx_reset();
     g_ops_base = ops;
     g_ops_n    = n;
-    for (int i = 0; i < n; i++) {
-        const q_op_t* op = &ops[i];
-        int64_t sid = ray_sym_intern(op->name, strlen(op->name));
-        /* every manifest name gets a slot — reserved-ness by sym id, even for
-         * rows with no value at either valence (`any`/`all`) */
-        sym_slot(sid, 1)->row = op;
-        if (add_entry(op, Q_MONADIC, &op->mon, sid)  != RAY_OK) {
-            g_building = false; q_registry_destroy(); return RAY_ERR_DOMAIN;
-        }
-        if (add_entry(op, Q_DYADIC,  &op->dyad, sid) != RAY_OK) {
-            g_building = false; q_registry_destroy(); return RAY_ERR_DOMAIN;
-        }
-    }
-    for (int i = 0; q_ops_syntax_word(i); i++)
-        reserve_name(ray_sym_intern(q_ops_syntax_word(i), strlen(q_ops_syntax_word(i))), &SYNTAX_WORD);
-    g_dotq = ray_sym_intern(".q", 2);
-    /* the paren-literal ctor IS the `enlist` verb's value (ADR: one value, not
-     * a spelling-less twin), so the wire codec can read code 41 off its row */
-    g_list_ctor = q_registry_row_value(q_ops_find("enlist", 6), Q_MONADIC);
-    if (!g_list_ctor) { g_building = false; q_registry_destroy(); return RAY_ERR_DOMAIN; }
     /* internal (spelling-less) specials — ONE build loop over SPECIALS[]; the
      * failed-build error path is written once (RAY_FN_Q_LOWER stamped here). */
     for (int s = 0; s < SPEC_N; s++) {
@@ -492,6 +550,32 @@ ray_err_t q_registry_init(void) {
         }
         g_iters[a] = v;
     }
+    for (int i = 0; i < n; i++) {
+        const q_op_t* op = &ops[i];
+        int64_t sid = ray_sym_intern(op->name, strlen(op->name));
+        /* every manifest name gets a slot — reserved-ness by sym id, even for
+         * rows whose value q.q supplies later (`any`/`all`) */
+        sym_slot(sid, 1)->row = op;
+        if (add_entry(op, Q_MONADIC, &op->mon, sid)  != RAY_OK) {
+            g_building = false; q_registry_destroy(); return RAY_ERR_DOMAIN;
+        }
+        if (add_entry(op, Q_DYADIC,  &op->dyad, sid) != RAY_OK) {
+            g_building = false; q_registry_destroy(); return RAY_ERR_DOMAIN;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (add_comp(&ops[i], Q_MONADIC, &ops[i].mon) != RAY_OK ||
+            add_comp(&ops[i], Q_DYADIC, &ops[i].dyad) != RAY_OK) {
+            g_building = false; q_registry_destroy(); return RAY_ERR_DOMAIN;
+        }
+    }
+    for (int i = 0; q_ops_syntax_word(i); i++)
+        reserve_name(ray_sym_intern(q_ops_syntax_word(i), strlen(q_ops_syntax_word(i))), &SYNTAX_WORD);
+    g_dotq = ray_sym_intern(".q", 2);
+    /* the paren-literal ctor IS the `enlist` verb's value (ADR: one value, not
+     * a spelling-less twin), so the wire codec can read code 41 off its row */
+    g_list_ctor = q_registry_row_value(q_ops_find("enlist", 6), Q_MONADIC);
+    if (!g_list_ctor) { g_building = false; q_registry_destroy(); return RAY_ERR_DOMAIN; }
     g_building = false;
     g_inited   = true;
     ray_serde_set_fn_hooks(serde_fn_writer, serde_fn_reader);
@@ -502,14 +586,8 @@ bool q_registry_ready(void) {
     return g_inited;
 }
 
-/* Install the QK_QSRC cells from the loaded q.q definitions (contract in
- * q_registry.h).  Same entry shape as add_entry, but the value is a SNAPSHOT
- * of the `.q.<target>` env binding rather than a built one — immutable like
- * every other cell (a `.q` builtin entry is a binding no write may change).
- * is_wrapper=1: the value is unique per cell, so pointer-identity provenance
- * is exact (q_registry_provenance).  Serde is UNTOUCHED by that flag: the
- * `q!…` fn-hook fires only for RAY_FN_Q_LOWER function values; carriers keep
- * riding whatever generic carrier serde exists. */
+/* Install the QK_QSRC cells from the loaded q.q definitions (contract in q_registry.h): the value is a SNAPSHOT of
+ * the `.q.<target>` env binding — a `.q` builtin entry is a binding no write may change. */
 static ray_err_t bind_qsrc_one(const q_op_t* op, q_valence_t valence,
                                const q_recipe_t* r) {
     if (r->kind != QK_QSRC) return RAY_OK;
@@ -520,21 +598,8 @@ static ray_err_t bind_qsrc_one(const q_op_t* op, q_valence_t valence,
     memcpy(full + 3, r->target, tl);
     ray_t* val = q_env_get(ray_sym_intern(full, tl + 3));     /* borrowed */
     if (!val || RAY_IS_ERR(val)) return RAY_ERR_DOMAIN;       /* q.q drift bug */
-    ray_t* kernel = r->fn ? build_wrapper(r) : NULL;
-    if (r->fn && (!kernel || RAY_IS_ERR(kernel))) return RAY_ERR_DOMAIN;
     ray_retain(val);
-    entry_t* e    = &g_entries[g_count++];
-    e->sym_id     = ray_sym_intern(op->name, strlen(op->name));
-    e->valence    = valence;
-    e->value      = val;
-    e->kernel     = kernel;
-    e->row        = op;
-    e->spelling   = op->name;
-    e->lower_name = r->target;
-    e->is_wrapper = 1;
-    e->alias_of   = NULL;
-    idx_add_entry(g_count - 1);
-    return RAY_OK;
+    return add_structure(op, valence, r, val);
 }
 
 ray_err_t q_registry_bind_qsrc(void) {
@@ -589,8 +654,7 @@ ray_t* q_registry_lookup_row(int64_t sym_id, q_valence_t valence,
 }
 
 int q_registry_is_reserved(int64_t sym_id) {
-    sym_slot_t* s = sym_slot(sym_id, 0);
-    return s && s->row != &DOTQ_BUILTIN;
+    return sym_slot(sym_id, 0) != NULL;
 }
 
 int q_registry_is_syntax_word(int64_t sym_id) {
@@ -607,10 +671,23 @@ void q_registry_seal(void) {
     g_sealed = true;
 }
 
+ray_t* q_registry_keyword(int64_t sym_id) {
+    ray_t* v = q_registry_lookup(sym_id, Q_MONADIC);
+    if (!v) v = q_registry_lookup(sym_id, Q_DYADIC);
+    sym_slot_t* s = sym_slot(sym_id, 0);
+    if (v || (s && s->row == &SYNTAX_WORD) || sym_id == q_env_marker_sym()) return v;
+    return q_env_ns_member(g_dotq, sym_id);
+}
+
+ray_t* q_registry_dotq_ext(int64_t sym_id) {
+    if (!g_sealed || sym_slot(sym_id, 0) || sym_id == q_env_marker_sym()) return NULL;
+    return q_env_ns_member(g_dotq, sym_id);
+}
+
 bool q_registry_sealed(void) { return g_sealed; }
 
 int q_registry_locked(int64_t sym_id) {
-    return g_sealed && sym_slot(sym_id, 0);
+    return g_sealed && q_registry_is_reserved(sym_id);
 }
 
 int q_registry_is_infix(const char* s, size_t n) {
@@ -627,6 +704,20 @@ ray_t* q_registry_row_value(const q_op_t* row, q_valence_t valence) {
 ray_t* q_registry_row_kernel(const q_op_t* row) {
     entry_t* e = row_entry(row, Q_MONADIC);
     return !e ? NULL : e->kernel ? e->kernel : e->value;   /* borrowed */
+}
+
+ray_t* q_registry_row_kernel_at(const q_op_t* row, q_valence_t valence) {
+    entry_t* e = row_entry(row, valence);
+    return e ? e->kernel : NULL;   /* borrowed */
+}
+
+ray_t* q_registry_intern_carrier(ray_t* fresh, int k, ray_t* head) {
+    if (k != Q_EVAL_CAR_COMP && k != Q_EVAL_CAR_PROJ && k != Q_EVAL_CAR_DERIV) return NULL;
+    for (int i = 0; i < g_car_n[k]; i++) {
+        const car_ent_t* c = &g_car[k][i];
+        if ((!c->head || c->head == head) && q_match_rec(c->value, fresh)) return c->value;
+    }
+    return NULL;
 }
 
 /* One env kernel shared by two manifest rows (`count` and monadic `#`) has no
@@ -666,15 +757,8 @@ int q_registry_kdb_op_of(const ray_t* value, q_valence_t* valence_out) {
 }
 
 ray_t* q_registry_kdb_op_value(int code, q_valence_t valence) {
-    if (code < 0) return NULL;
-    int n = 0;
-    const q_op_t* ops = q_ops_table(&n);
-    for (int i = 0; i < n; i++) {
-        if (q_ops_kdb_op(&ops[i]) != code) continue;
-        ray_t* v = q_registry_row_value(&ops[i], valence);
-        if (v) return v;
-    }
-    return NULL;
+    const entry_t* e = code_entry(code, valence);
+    return e ? e->value : NULL;
 }
 
 /* Exact for unique values; NULL when several rows alias one env object at
@@ -690,13 +774,13 @@ const q_op_t* q_registry_operand_row(const ray_t* value) {
 }
 
 bool q_registry_provenance(const ray_t* value, q_provenance_t* out) {
-    /* Wrapper values are UNIQUE objects (born rc=1 per row) — pointer identity
-     * is exact for them.  Pass-through/rename values ARE the shared env builtin
+    /* A wrapper value is unique to its primitive: rows sharing a kdb code share
+     * it, and the first-registered (the glyph) names it.  Pass-through/rename values ARE the shared env builtin
      * object, and several q spellings can alias one env object (e.g. `#`-monadic
      * and `count` both embed env `count`; `-`-monadic and `neg` both embed env
      * `neg`).  For those, pointer identity alone cannot recover THE q spelling —
      * an inherent limitation of the reuse-the-env-object design.  So: prefer the
-     * unique WRAPPER entry (always correct); for an aliased pass-through, return
+     * first WRAPPER entry; for an aliased pass-through, return
      * the first-registered spelling (2b's formatter disambiguates aliased
      * pass-throughs from the parse-site glyph, not from this value-keyed API).
      * QK_ALIAS entries are skipped outright: they are a second NAME for a value

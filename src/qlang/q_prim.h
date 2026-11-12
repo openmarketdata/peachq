@@ -42,14 +42,17 @@ ray_t* q_table_map_cols(ray_t* (*colfn)(void* ctx, ray_t* col), void* ctx, ray_t
  * q_list_collapse) for the env-using apply module. */
 ray_t* q_typed_empty_like(ray_t* collapsed, ray_t* proto);
 
-/* `~` — THE match home (DEFINED in ops/q_math.c), as a C predicate and as the verb: the verb form is the LOUD
+/* `~` — THE match home (DEFINED in ops/q_match.c), as a C predicate and as the verb: the verb form is the LOUD
  * entry, answering 'stack where the predicate can only answer mismatch, so Converge's stop test rides it. */
 int q_match_rec(ray_t* a, ray_t* b);
+/* the same walk with no float tolerance: Find's sameness for a boxed cell (precision.md:217-219), so there `?` agrees
+ * with `~` on all else; typed Find keeps its own lane rules (the int/long widening) */
+int q_match_exact(ray_t* a, ray_t* b);
 ray_t* q_match_wrap(ray_t* a, ray_t* b);
 
 /* `?` Find — x?y: the first index in x of y, or of each item of y; a miss is `count x`; a dict answers keys.
  * Borrows both; owned result or owned error.  q_search_find_item: the first index of x (a boxed list) whose
- * ITEM whole-matches v, else cnt.  Both DEFINED in ops/q_search.c; declared here (like q_list_collapse) so the
+ * ITEM matches v whole under Find's sameness (q_match_exact), else cnt.  Both DEFINED in ops/q_search.c; declared here (like q_list_collapse) so the
  * eval family (funsql's domain Find) reaches them without the poisoned q_registry_internal.h. */
 ray_t* q_search_find(ray_t* x, ray_t* y);
 int64_t q_search_find_item(ray_t* x, ray_t* v, int64_t cnt);
@@ -129,7 +132,7 @@ typedef enum {
 q_edom_t q_enum_domain_kind(int64_t dom, ray_t** vals); /* *vals = borrowed VALUE LIST (SYMLIST/KEYED1) */
 int     q_enum_is(ray_t* x);                       /* vec 20h / atom -20h */
 int64_t q_enum_domain(ray_t* x);                   /* domain-name sym id (slice-aware, letter masked) */
-char    q_enum_attr(ray_t* x);                     /* the 20h attribute letter, 0 = none */
+char    q_enum_attr(ray_t* x);                     /* the domain slot's vouched `s`, 0 = none (u/g/p: q_attr_letter) */
 int     q_enum_attr_set(ray_t* x, char letter);    /* EXCLUSIVE x: stamp/clear the letter */
 ray_t*  q_enum_stamp(ray_t* v, int64_t dom);       /* consumes owned i64 value -> enum */
 ray_t*  q_enum_positions(ray_t* e);                /* owned plain-i64 copy */
@@ -200,6 +203,7 @@ ray_t* q_attr_stamp_byte(ray_t* v, uint8_t byte);
  * column (or a remapped q error).  Exposed for the attribute-acceleration
  * C-unit (test/q_attr_accel.c) to exercise the real q set-attribute path. */
 ray_t* q_attr_set_letter(char letter, ray_t* vec);
+ray_t* q_attr_sort_keyed_key(ray_t* y);   /* the in-place half of `s#kt`: borrows y; NULL or the owned error */
 
 /* q `ssr[s;p;r]` — string search-and-replace (feat/q-string-fns).  Exposed so
  * q_builtins_register can env-bind it (a triadic prefix keyword: the parser

@@ -112,12 +112,16 @@ a JSON object, a field missing, or a value its column cannot take), `mismatch` (
 columns), `dupkey` (a key twice in one object), `tombstone` (a null value the `tombstones` option rejects), or
 another verdict of the JSON loader's.
 
-Replace `.kafka.errcb` as you would `.z.pc`; if yours signals, the error it was given is still printed. librdkafka's own
-errors (a broker down, a rebalance failing) arrive there too.
+Replace it with `.kafka.set_errcb`; if yours signals, its error is printed. librdkafka's own
+errors (a broker down, a rebalance failing) arrive there too. `.kafka.set_statcb` sets the function librdkafka's
+statistics JSON is handed to, every `statistics.interval.ms`.
 
 ```q
-q).kafka.errcb:{[h;code;reason] alert[code;reason]}
+q).kafka.set_errcb {[h;code;reason] alert[code;reason]}
 ```
+
+Set a hook by calling its setter, never by assigning `.kafka.errcb` before the library has loaded: the assignment makes
+`.kafka` your own namespace, and the library no longer autoloads into it.
 
 ## A topic as a table
 
@@ -141,6 +145,10 @@ read. Every read is strict about decoding and changes no state: a message that d
 naming it and the way past it (`ignore_errors` or `store_rejects` in `.kafka.read`'s options). A tombstone is no
 decode error: a read lands it as a row of nulls beside its message columns, and counts it; `.kafka.read`'s
 `tombstones` as `` `skip `` leaves it out. `upsert` writes floats at full precision and times as ISO 8601.
+
+A bounded read waits up to `.kafka.TIMEOUT` ms (10000) for a quiet partition before it signals, and a topic's schema is
+sniffed from the last `.kafka.SAMPLE` messages of each partition (20480). Set them with `.kafka.set_timeout ms` and
+`.kafka.set_sample n`.
 
 ## Committing
 

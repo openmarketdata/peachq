@@ -13,6 +13,7 @@
 #include "qlang/ops/q_dollar.h" /* q_dollar_cast — Append's int/long pair cast to the vector's type */
 #include "qlang/ops/q_index.h" /* q_index_grow* — a parked vector grows where it stands; q_index_rank — the `,:` rank rule */
 #include "qlang/eval/q_eval.h" /* q_eval_apply_value — pj rides q's own `+` */
+#include "qlang/q_builtins.h"    /* q_builtins_type_num — the time columns' q type */
 #include "lang/eval.h"     /* ray_left_join_fn, ray_window_join*_fn */
 #include "lang/internal.h" /* ray_asof_join_fn, ray_concat_fn, ray_vec_set_null, ray_error */
 #include "table/sym.h"     /* ray_sym_intern_runtime, RAY_SYM_W64 */
@@ -25,7 +26,8 @@
  * PR #56's q_join.c (algorithms twice-reviewed there; the parallel-file
  * placement was the failure mode).  THE core rule: the hash/asof MATCHING is
  * ALWAYS the engine's (ray_left_join_fn / ray_asof_join_fn / window-join,
- * src/ops/join.c machinery); this section only prepares rowid-augmented key
+ * src/ops/join.c machinery), but a nested key, which that hash reads by its
+ * pointer, matches through row Find (qj_find_pairs); this section only prepares rowid-augmented key
  * tables, reorders the engine's match relation to kdb row order, and
  * assembles result columns by vector gather.  Keyed-table primitives are the
  * single-home helpers (q_type_is_keyed in ops/q_table.c, q_bang_enkey in q_bang.c,
@@ -97,7 +99,8 @@ static ray_t* qj_col_gather(ray_t* col, const int64_t* idx, int64_t n) {
         ((int64_t*)ray_data(iv))[i] = (idx[i] < 0) ? 0 : idx[i];
         if (idx[i] < 0) ray_vec_set_null(iv, i, true);
     }
-    ray_t* g = ray_at_fn(col, iv);
+    /* a general list's miss is q's, shaped by its first item; base indexing answers 0N */
+    ray_t* g = col && col->type == RAY_LIST ? q_index_at(col, &iv, 1) : ray_at_fn(col, iv);
     ray_release(iv);
     if (!g || RAY_IS_ERR(g)) return g ? g : q_err(QE_TYPE);
     if (g->type == RAY_LIST) {
@@ -163,9 +166,9 @@ static ray_t* qj_rowid_col(int64_t n) {
 }
 
 /* Minimal join input: `keys` columns of t (borrowed, re-added under the same
- * names) plus a rowid column named rid_sym.  keys = RAY_LIST of sym atoms
- * (kept BOXED end-to-end: the engine unboxes itself and the helpers here
- * index ray_t** — never collapse to a sym vector). */
+ * names) plus a rowid column named rid_sym, none when it is -1.  keys = RAY_LIST
+ * of sym atoms (kept BOXED end-to-end: the engine unboxes itself and the helpers
+ * here index ray_t** — never collapse to a sym vector). */
 static ray_t* qj_keyid_table(ray_t* t, ray_t* keys, int64_t rid_sym) {
     int64_t nk = q_count(keys);
     ray_t** ke = (ray_t**)ray_data(keys);
@@ -180,6 +183,7 @@ static ray_t* qj_keyid_table(ray_t* t, ray_t* keys, int64_t rid_sym) {
         out = ray_table_add_col(out, ke[i]->i64, col);
         if (RAY_IS_ERR(out)) return out;
     }
+    if (rid_sym < 0) return out;
     ray_t* rid = qj_rowid_col(q_count(t));
     if (RAY_IS_ERR(rid)) { ray_release(out); return rid; }
     out = ray_table_add_col(out, rid_sym, rid);
@@ -187,12 +191,61 @@ static ray_t* qj_keyid_table(ray_t* t, ray_t* keys, int64_t rid_sym) {
     return out;
 }
 
+/* A key column that is not a typed vector: the hash join reads a nested cell by its pointer (join.c hash_row_keys). */
+static int qj_keys_nested(ray_t* t, ray_t* keys) {
+    ray_t** ke = (ray_t**)ray_data(keys);
+    for (int64_t i = 0, nk = q_count(keys); i < nk; i++) {
+        ray_t* c = ray_table_get_col(t, ke[i]->i64);
+        if (c && (c->type == RAY_LIST || c->type == RAY_STR || c->type == RAY_TABLE)) return 1;
+    }
+    return 0;
+}
+
+/* The relation for nested keys, matched by row Find (`~` without tolerance): x row l's first y match is (yk?xk)[l], and `all` adds
+ * the rest of its class, the y rows whose own first match (yk?yk) is the same row.  qj_join_pairs' contract. */
+static int64_t qj_find_pairs(ray_t* x, ray_t* y, ray_t* keys, int all, qj_pair_t** out, ray_t** err) {
+    ray_t* o[4] = { qj_keyid_table(x, keys, -1), NULL, NULL, NULL };         /* xk, yk, yk?xk, yk?yk */
+    if (!RAY_IS_ERR(o[0])) o[1] = qj_keyid_table(y, keys, -1);
+    if (o[1] && !RAY_IS_ERR(o[1])) o[2] = q_search_find(o[1], o[0]);
+    if (all && o[2] && !RAY_IS_ERR(o[2])) o[3] = q_search_find(o[1], o[1]);
+    for (int i = 0; i < 4 && !*err; i++) if (o[i] && RAY_IS_ERR(o[i])) { *err = o[i]; o[i] = NULL; }
+    int64_t nx = q_count(x), ny = q_count(y), np = 0;
+    int64_t* lo = *err || !all ? NULL : (int64_t*)calloc((size_t)(2 * ny + 1), sizeof(int64_t));
+    qj_pair_t* pairs = NULL;
+    if (!*err && (!all || lo)) {
+        const int64_t* fd = (const int64_t*)ray_data(o[2]);
+        int64_t* mem = lo ? lo + ny + 1 : NULL;          /* each class's rows, in row order, at [lo[c], lo[c+1]) */
+        if (lo) {
+            const int64_t* gd = (const int64_t*)ray_data(o[3]);
+            for (int64_t r = 0; r < ny; r++) lo[gd[r] + 1]++;
+            for (int64_t r = 0; r < ny; r++) lo[r + 1] += lo[r];
+            for (int64_t r = 0; r < ny; r++) mem[lo[gd[r]]++] = r;
+            for (int64_t r = ny; r > 0; r--) lo[r] = lo[r - 1];
+            lo[0] = 0;
+        }
+        for (int64_t l = 0; l < nx; l++) np += lo && fd[l] < ny ? lo[fd[l] + 1] - lo[fd[l]] : 1;
+        pairs = (qj_pair_t*)malloc((size_t)(np > 0 ? np : 1) * sizeof(qj_pair_t));
+        for (int64_t l = 0, w = 0; pairs && l < nx; l++) {
+            if (!lo || fd[l] >= ny) pairs[w++] = (qj_pair_t){ l, fd[l] < ny ? fd[l] : -1 };
+            else for (int64_t i = lo[fd[l]]; i < lo[fd[l] + 1]; i++) pairs[w++] = (qj_pair_t){ l, mem[i] };
+        }
+    }
+    if (!*err && !pairs) *err = q_err(QE_WSFULL);
+    free(lo);
+    for (int i = 0; i < 4; i++) if (o[i]) ray_release(o[i]);
+    if (*err) return -1;
+    *out = pairs;
+    return np;
+}
+
 /* Full sorted match relation between x rows and y rows on `keys` (RAY_LIST of
- * sym atoms; columns of both).  Returns pair count (>=0) with *out malloc'd
- * (caller frees), or -1 with *err set. */
-static int64_t qj_join_pairs(ray_t* x, ray_t* y, ray_t* keys,
+ * sym atoms; columns of both); without `all` only each x row's FIRST y match is
+ * promised.  Returns pair count (>=0) with *out malloc'd (caller frees), or -1
+ * with *err set. */
+static int64_t qj_join_pairs(ray_t* x, ray_t* y, ray_t* keys, int all,
                              qj_pair_t** out, ray_t** err) {
     *out = NULL; *err = NULL;
+    if (qj_keys_nested(x, keys) || qj_keys_nested(y, keys)) return qj_find_pairs(x, y, keys, all, out, err);
     int64_t lrid = qj_tmp_colname("qjl", x, y);
     int64_t rrid = qj_tmp_colname("qjr", x, y);
     ray_t* lk = qj_keyid_table(x, keys, lrid);
@@ -240,10 +293,10 @@ static int64_t* qj_first_map(const qj_pair_t* pairs, int64_t np, int64_t nx) {
 }
 
 /* TYPE-PRESERVING column fill (codex plan-review F2): result[i] = gy[i]
- * unless gy[i] is a q-null, else xc[i].  A pure gather over concat(xc, gy)
- * keeps the column type exact (no I64/F64 widening); the per-cell null test
- * reads boxed items. */
-static ray_t* qj_fill_col(ray_t* xc, ray_t* gy, int64_t nx) {
+ * unless row i missed (map[i] < 0) or gy[i] is a q-null, else xc[i].  A pure
+ * gather over concat(xc, gy) keeps the column type exact (no I64/F64
+ * widening); the per-cell null test reads boxed items. */
+static ray_t* qj_fill_col(ray_t* xc, ray_t* gy, const int64_t* map, int64_t nx) {
     ray_t* cat = ray_concat_fn(xc, gy);
     if (!cat || RAY_IS_ERR(cat)) return cat ? cat : q_err(QE_TYPE);
     int64_t* idx2 = (int64_t*)malloc((size_t)(nx > 0 ? nx : 1) * sizeof(int64_t));
@@ -251,7 +304,7 @@ static ray_t* qj_fill_col(ray_t* xc, ray_t* gy, int64_t nx) {
     for (int64_t i = 0; i < nx; i++) {
         ray_t* yi = q_join_gen_item(gy, i);
         if (!yi || RAY_IS_ERR(yi)) { free(idx2); ray_release(cat); return yi ? yi : q_err(QE_TYPE); }
-        idx2[i] = qj_atom_is_qnull(yi) ? i : nx + i;
+        idx2[i] = map[i] < 0 || qj_atom_is_qnull(yi) ? i : nx + i;
         ray_release(yi);
     }
     ray_t* r = qj_col_gather(cat, idx2, nx);
@@ -287,7 +340,7 @@ static ray_t* qj_merge_col(ray_t* xc, ray_t* yc, const int64_t* fmap,
     if (!gy || RAY_IS_ERR(gy)) return gy ? gy : q_err(QE_TYPE);
     ray_t* r;
     if (mode == 1) {
-        r = qj_fill_col(xc, gy, nx);               /* y nulls keep x, type-safe */
+        r = qj_fill_col(xc, gy, fmap, nx);         /* y nulls keep x, type-safe */
     } else {
         ray_t* zero = ray_i64(0);
         ray_t* zf = q_fill_wrap(zero, gy);         /* 0^gathered (pj is numeric) */
@@ -394,7 +447,7 @@ static ray_t* qj_lj_core(ray_t* x, ray_t* y, int mode, int inner) {
     ray_t* yflat = q_table_flatten(y);
     if (!yflat || RAY_IS_ERR(yflat)) { ray_release(keys); return yflat; }
     qj_pair_t* pairs; ray_t* err;
-    int64_t np = qj_join_pairs(x, yflat, keys, &pairs, &err);
+    int64_t np = qj_join_pairs(x, yflat, keys, 0, &pairs, &err);
     if (np < 0) { ray_release(keys); ray_release(yflat); return err; }
     int64_t nx = q_count(x);
     int64_t* fmap = qj_first_map(pairs, np, nx);
@@ -476,7 +529,7 @@ static ray_t* qj_ej_impl(ray_t* c, ray_t* t1, ray_t* t2) {
     ray_t* keys = qj_norm_keys(c);
     if (!keys) return q_err(QE_TYPE);
     qj_pair_t* pairs; ray_t* err;
-    int64_t np = qj_join_pairs(t1, t2, keys, &pairs, &err);
+    int64_t np = qj_join_pairs(t1, t2, keys, 1, &pairs, &err);
     if (np < 0) { ray_release(keys); return err; }
     /* matched pairs only, already (l, r)-sorted */
     int64_t m = 0;
@@ -586,7 +639,7 @@ static ray_t* qj_ktbl_merge(ray_t* x, ray_t* y, int mode) {
     ray_t* keys = qj_key_syms(yk);
     if (!keys || RAY_IS_ERR(keys)) { ray_release(xf); ray_release(part1); ray_release(yf); return keys ? keys : q_err(QE_TYPE); }
     qj_pair_t* pairs; ray_t* err;
-    int64_t np = qj_join_pairs(yf, xf, keys, &pairs, &err);
+    int64_t np = qj_join_pairs(yf, xf, keys, 0, &pairs, &err);
     ray_release(keys);
     ray_release(xf);
     if (np < 0) { ray_release(part1); ray_release(yf); return err; }
@@ -730,10 +783,31 @@ ray_t* q_ujf_wrap(ray_t* x, ray_t* y) { return qj_uj_core(x, y, 1); }
  * returns a per-t1-row match INDEX into t2 (null=miss) and all column
  * assembly is the same gather/merge machinery as lj. */
 
+/* The time column's q type for the matching-type rule; 0 = left unchecked.  An enum reads as its sym domain, a native
+ * string as a char vector; a general list or physical string storage is not ruled on (owner 2026-11-08: storage
+ * alone is never a mismatch). */
+static int8_t qj_time_type(ray_t* col) {
+    int8_t t = q_builtins_type_num(col);
+    if (t == RAY_ENUM) return RAY_SYM;
+    if (t == -RAY_STR) return RAY_CHARV;
+    return t == RAY_LIST || t == RAY_STR ? 0 : t;
+}
+
 /* per-t1-row match index into t2 (or -1), via engine asof-join.  Returns
  * owned malloc'd array of n1 entries or NULL with *err set. */
 static int64_t* qj_aj_map(ray_t* keys, ray_t* t1, ray_t* t2, ray_t** err) {
     *err = NULL;
+    int64_t nk = q_count(keys);
+    if (nk > 0) {
+        int64_t time_sym = ((ray_t**)ray_data(keys))[nk - 1]->i64;
+        ray_t* lt = ray_table_get_col(t1, time_sym);       /* borrowed */
+        ray_t* rt = ray_table_get_col(t2, time_sym);       /* borrowed */
+        /* owner ruling 2026-11-08 + ref/aj.md:21 "of matching type": the time columns' q types must agree */
+        if (lt && rt) {
+            int8_t lq = qj_time_type(lt), rq = qj_time_type(rt);
+            if (lq && rq && lq != rq) { *err = q_err(QE_TYPE); return NULL; }
+        }
+    }
     int64_t rid = qj_tmp_colname("ajr", t1, t2);
     ray_t* rk = qj_keyid_table(t2, keys, rid);
     if (!rk || RAY_IS_ERR(rk)) { *err = rk ? rk : q_err(QE_TYPE); return NULL; }
@@ -787,7 +861,7 @@ static ray_t* qj_aj_core(ray_t* c, ray_t* t1, ray_t* t2, int t0mode, int fill) {
                 ray_t* gt = tt ? qj_col_gather(tt, map, n1)
                                : q_err(QE_TYPE);
                 if (gt && !RAY_IS_ERR(gt) && fill) {
-                    ray_t* f = qj_fill_col(xc, gt, n1);
+                    ray_t* f = qj_fill_col(xc, gt, map, n1);
                     ray_release(gt);
                     gt = f;
                 }
@@ -803,7 +877,7 @@ static ray_t* qj_aj_core(ray_t* c, ray_t* t1, ray_t* t2, int t0mode, int fill) {
                  * ajf keeps t1 where t2 is null / missed */
                 ray_t* gy = qj_col_gather(yc, map, n1);
                 if (gy && !RAY_IS_ERR(gy) && fill) {
-                    ray_t* f = qj_fill_col(xc, gy, n1);
+                    ray_t* f = qj_fill_col(xc, gy, map, n1);
                     ray_release(gy);
                     gy = f;
                 }
@@ -1354,7 +1428,10 @@ ray_t* q_join_amend(ray_t** px, ray_t* y, int exclusive) {
         return q_err(QE_TYPE);
     ray_t* py = pair ? q_dollar_cast(x->type, y) : y;
     if (pair && (!py || RAY_IS_ERR(py))) return py ? py : q_err(QE_OOM);
-    if (x && y && (x->type == RAY_LIST || x->type == RAY_STR) && q_count(x) > 0 && q_index_rank(x) == q_index_rank(y) + 1) {
+    /* `()` has no first element to rank, so it appends nothing (uqf dag.q:256 `lines,:f each ext` on an empty ext) */
+    int none = y && y->type == RAY_LIST && q_count(y) == 0;
+    if (x && y && !none && (x->type == RAY_LIST || x->type == RAY_STR) && q_count(x) > 0 &&
+        q_index_rank(x) == q_index_rank(y) + 1) {
         py = ray_enlist_fn(&y, 1);
         if (!py || RAY_IS_ERR(py)) return py ? py : q_err(QE_OOM);
     }

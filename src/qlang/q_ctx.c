@@ -22,7 +22,7 @@
 #include "qlang/ops/q_sys.h"      /* q_sys_gc_mode / q_sys_err_trap_mode — the statement-seam policy; q_sys_prompt */
 #include "qlang/io/q_io.h"        /* q_io_read_slice — THE byte core a load reads through */
 #include "lang/env.h"             /* ray_fn_unary — the .pq.i.console native */
-#include "lang/eval.h"            /* ray_eval_is_interrupted, ray_eval_set_remote_value_fn, RAY_FN_NONE */
+#include "lang/eval.h"            /* ray_eval_set_remote_value_fn, RAY_FN_NONE */
 #include "mem/heap.h"             /* ray_heap_gc — the `\g 1` statement-end collect */
 #include "mem/sys.h"              /* ray_sys_alloc — a statement's C-string scratch */
 #include "ops/ops.h"              /* ray_is_lazy, ray_lazy_materialize */
@@ -42,6 +42,26 @@ static void (*g_tty_restore)(void);
 void q_ctx_set_console_close(void (*fn)(void)) { g_console_close = fn; }
 void q_ctx_set_tty_restore(void (*fn)(void))   { g_tty_restore = fn; }
 static void ctx_tty_restore(void) { if (g_tty_restore) g_tty_restore(); }
+
+/* the base flag is the backstop for an embedder's own ray_request_interrupt: read once per statement, never per node */
+int q_ctx_interrupt_take(int served) {
+    int took = q_eval_interrupt_take();
+    if (ray_interrupted()) { ray_clear_interrupt(); took = 1; }
+    ray_term_clear_interrupt();
+    if (served) q_eval_interrupt_served();
+    return took;
+}
+static volatile sig_atomic_t g_cb_depth;
+
+void q_ctx_callback_begin(void) {
+    if (g_cb_depth++) return;
+    q_ctx_interrupt_take(0);
+}
+
+void q_ctx_callback_end(void) { g_cb_depth--; }
+
+int q_ctx_in_callback(void) { return g_cb_depth > 0; }
+
 /* The console line running now (innermost: a q)) line inside the q) line it suspended), for the line-done hook. */
 typedef struct { const char* s; size_t n; int64_t t0; } ctx_line_t;
 static ctx_line_t g_line;
@@ -86,7 +106,7 @@ static void ctx_show_err(FILE* out, FILE* err, ray_t* e) {
     ctx_tty_restore();
     if (!q_dbg_reported(e)) {
         fflush(out);               /* echo/prompt land before the trace */
-        q_dbg_print_trace(err, e);
+        q_dbg_print_trace(err, e, 1);
     }
     q_err_drop();
     ray_error_free(e);
@@ -111,7 +131,7 @@ static int ctx_load_abort(ray_t* e, FILE* out, FILE* err, q_err_sig_t* t) {
     ctx_tty_restore();
     if (!q_dbg_reported(e) && !q_dbg_trapped()) {
         fflush(out);
-        q_dbg_print_trace(err, e);
+        q_dbg_print_trace(err, e, 1);
     }
     q_err_detach(e, t);
     ray_error_free(e);
@@ -133,6 +153,7 @@ static int ctx_line_run(const char* s, size_t n, FILE* out, FILE* err,
                         int print_result, int in_load, int console, int dbg_line, ray_t** esig) {
     if (n == 0)
         return 0;
+    if (!in_load && !dbg_line) q_ctx_interrupt_take(1);   /* a nested line keeps the one meant for its statement */
 
     /* The statement seam: frame-[0] text + suspendability (IPC never suspends;
      * a load line INHERITS it from the statement that asked for the load), and
@@ -182,16 +203,9 @@ static int ctx_line_run(const char* s, size_t n, FILE* out, FILE* err,
      * reaches its `.help` hook here — after the eval, never mid-eval. */
     q_comment_stmt_end();
 
-    /* Mirror repl.c's post-eval contract: a Ctrl-C that landed during eval
-     * means "stop" even when a non-polling C kernel absorbed it and the
-     * eval completed with a normal result — the result is discarded, never
-     * printed (repl.c prints ^C there; q reports the qdocs 'stop error:
-     * "Current operation stopped due to user interrupt (Ctrl-c)").  The
-     * polling paths surface the same flag as a 'limit error, so this one
-     * check covers both. */
-    if (ray_eval_is_interrupted() || ray_term_interrupted()) {
-        ray_eval_clear_interrupt();
-        ray_term_clear_interrupt();
+    /* a Ctrl-C that landed during eval means "stop" even when a non-polling C kernel absorbed it and the eval
+     * completed with a normal result — the result is discarded, never printed (errors.md `stop`) */
+    if (q_ctx_interrupt_take(1)) {
         if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r);
         q_err_drop();              /* the discarded error's text never re-renders */
         ray_t* stop = q_err(QE_STOP);
@@ -207,6 +221,7 @@ static int ctx_line_run(const char* s, size_t n, FILE* out, FILE* err,
     }
 
     if (RAY_IS_ERR(r)) {
+        if (q_err_is(r, QE_STOP)) q_eval_interrupt_served();   /* a 'stop that reaches the console was seen */
         if (in_load) {
             ray_t* rep = q_dbg_load_filter(r);
             if (rep && !RAY_IS_ERR(rep)) {     /* :r — discard, the load continues */
@@ -283,7 +298,10 @@ int q_ctx_run_debug_line(const char* s, size_t n, FILE* out, FILE* err) {
  * text and an IPC request: there EVERY line continues the one before,
  * `;` alone separates statements (owner ruling 2026-10-08). */
 /* docs/text-entry-law.md: the via-file and IPC columns */
-static int ctx_walk_script(const char* src, size_t len, int64_t file_sym, int value_door, q_ctx_stmt_fn fn, void* u) {
+/* `keep_comments` (.Q.ld) only groups: each comment line is an entry of its own, borrowed and not NUL-terminated,
+ * and nothing is captured as documentation. */
+static int ctx_walk_script(const char* src, size_t len, int64_t file_sym, int value_door, int keep_comments,
+                           q_ctx_stmt_fn fn, void* u) {
     if (!src) { src = ""; len = 0; }     /* an empty read owns no buffer; `src + len` must stay defined */
 
     /* ONE logical line, joined.  Bounded by the SOURCE: a physical line adds
@@ -300,8 +318,8 @@ static int ctx_walk_script(const char* src, size_t len, int64_t file_sym, int va
      *  - blank lines, whitespace-only lines, and comment lines (trimmed first
      *    char '/') are IGNORED for continuation — they do NOT flush the
      *    accumulator (so `a:1 2` <blank> `/c` <blank> ` 3` ` + 4` => a:5 6 7);
-     *  - a trimmed singleton `/` opens a `/`..`\` block comment (skip to a
-     *    trimmed singleton `\`); a trimmed singleton `\` (outside a block) EXITS
+     *  - a column-0 singleton `/` opens a `/`..`\` block comment (skip to a
+     *    column-0 singleton `\`); a trimmed singleton `\` (outside a block) EXITS
      *    the script (load-time syntax); `\\` / `exit x` evaluate normally and
      *    terminate the PROCESS via q_sys_exit (kdb-true).
      * Continuation fragments are joined with '\n' (now whitespace to the
@@ -311,13 +329,15 @@ static int ctx_walk_script(const char* src, size_t len, int64_t file_sym, int va
     const char* p = src;
     const char* pend = src + len;
     int64_t     lineno = 0;
+    int64_t     start = 0;
     q_parse_open_t open = { 0 };               /* stays zeroed at the script door */
 
     /* Doc headers ride this same classification — see q_comment.h.  Every arm
      * below states what it means for the run: a blank line, a `/`..`\` block
      * and any CONTINUATION line all end it, so a mid-body comment can never
      * leak onto the next definition. */
-    q_comment_script_t dsaved = q_comment_script_begin(file_sym);
+    q_comment_script_t dsaved = { 0 };
+    if (!keep_comments) dsaved = q_comment_script_begin(file_sym);
 
     /* ANY failing statement aborts the LOAD (kdb stops a script at the error;
      * qsql.md:168's parse-time 'dup and a mid-file eval error both fire here,
@@ -325,7 +345,7 @@ static int ctx_walk_script(const char* src, size_t len, int64_t file_sym, int va
      * console the eval error may first SUSPEND into the debugger — ctx_line's
      * load seam — and a `:r` resume continues the load instead of aborting. */
     int lrc = 0;
-    #define FLUSH() do { if (alen) { lrc = fn(acc, alen, u); alen = 0; } } while (0)
+    #define FLUSH() do { if (alen) { lrc = fn(acc, alen, start, u); alen = 0; } } while (0)
 
     while (p < pend) {
         const char* line = p;
@@ -353,22 +373,30 @@ static int ctx_walk_script(const char* src, size_t len, int64_t file_sym, int va
         int indented = (lead > 0);
 
         if (in_block) {                          /* inside a /..\ block comment */
-            if (tlen == 1 && trim[0] == '\\') in_block = 0;   /* singleton \ closes; no flush */
+            if (tlen == 1 && trim[0] == '\\' && !indented) in_block = 0;   /* only a column-0 singleton \ closes (corpus.q:300) */
+            if (tlen && keep_comments && (lrc = fn(line, n, lineno, u))) break;
             continue;
         }
         if (!open.in_string && !open.in_literal) {
-            if (tlen == 0) { q_comment_break(); continue; }  /* blank/whitespace-only: ignored, no flush */
-            if (tlen == 1 && trim[0] == '/') { in_block = 1; q_comment_break(); continue; }  /* open block; no flush */
+            if (tlen == 0) { if (!keep_comments) q_comment_break(); continue; }  /* blank: ignored, no flush */
             if (tlen == 1 && trim[0] == '\\') break; /* singleton \ exits (post-loop FLUSH runs)  */
-            if (trim[0] == '/') { q_comment_line(trim, tlen); continue; }  /* comment-only line: ignored, no flush */
+            if (trim[0] == '/') {                    /* a comment line, or the `/` opening a block: no flush */
+                in_block = tlen == 1 && !indented;   /* an indented lone `/` is a comment (qstats linalg.q:50) */
+                if (keep_comments) {
+                    if ((lrc = fn(line, n, lineno, u))) break;
+                } else if (in_block) q_comment_break();
+                else q_comment_line(trim, tlen);
+                continue;
+            }
         }
 
         int is_cont = alen > 0 && (value_door || indented);
-        if (is_cont) q_comment_break();                 /* a continuation cannot be documented */
-        else {                                          /* eval the prior line, arm this one */
+        if (is_cont) { if (!keep_comments) q_comment_break(); }  /* a continuation cannot be documented */
+        else {                                          /* flush the prior line, arm this one */
             FLUSH();
             if (lrc) break;
-            q_comment_fresh_line(lineno);
+            start = lineno;
+            if (!keep_comments) q_comment_fresh_line(lineno);
             open = (q_parse_open_t){ 0 };
         }
 
@@ -385,9 +413,9 @@ static int ctx_walk_script(const char* src, size_t len, int64_t file_sym, int va
             acc[alen] = '\0';
         }
     }
-    if (!lrc) FLUSH();                             /* eval any pending logical line (incl. before a lone \) */
+    if (!lrc) FLUSH();                             /* flush any pending logical line (incl. before a lone \) */
     #undef FLUSH
-    q_comment_script_end(dsaved);
+    if (!keep_comments) q_comment_script_end(dsaved);
     ray_sys_free(acc);
     return lrc;
 }
@@ -399,7 +427,7 @@ typedef struct { FILE* out; FILE* err; int print_result; char lang; ray_t** esig
  * through `.X.e` — embedPy's `.t` suites are scored that way.  Prefixing is the whole routing: the
  * text seam already strips every leading `<letter>)` and keeps the RIGHTMOST, so a `p)` line inside
  * a `.t` file still reaches `.p.e`.  `q` and `k` keep their own doors. */
-static int ctx_load_stmt(const char* s, size_t n, void* u) {
+static int ctx_load_stmt(const char* s, size_t n, int64_t line, void* u) {
     ctx_load_t* ld = (ctx_load_t*)u;
     if (!ld->lang) return ctx_line(s, n, ld->out, ld->err, ld->print_result, 1, -1, 0, ld->esig);
     char* t = (char*)ray_sys_alloc(n + 3);
@@ -450,14 +478,14 @@ static int ctx_run_script(const char* src, size_t len, int64_t file_sym, int pri
                           char lang, FILE* out, FILE* err, ray_t** esig) {
     ctx_load_scope_t scope = ctx_load_enter();
     ctx_load_t       ld    = { out, err, print_result, lang, esig };
-    int              lrc   = ctx_walk_script(src, len, file_sym, 0, ctx_load_stmt, &ld);
+    int              lrc   = ctx_walk_script(src, len, file_sym, 0, 0, ctx_load_stmt, &ld);
     ctx_load_leave(scope, !lrc);
     if (lrc && esig && *esig && !q_dbg_trapped()) q_dbg_mark_reported(*esig);
     return lrc ? 1 + lrc : 0;
 }
 
 /* The value door's line: keep the latest answer, stop at the first error. */
-static int ctx_eval_stmt(const char* s, size_t n, void* u) {
+static int ctx_eval_stmt(const char* s, size_t n, int64_t line, void* u) {
     ray_t** last = (ray_t**)u;
     ray_t*  r    = q_eval_statement(s, NULL);
     if (ray_is_lazy(r)) r = ray_lazy_materialize(r);
@@ -468,13 +496,44 @@ static int ctx_eval_stmt(const char* s, size_t n, void* u) {
 }
 
 int q_ctx_file_statements(const char* s, size_t n, q_ctx_stmt_fn fn, void* u) {
-    return ctx_walk_script(s, n, 0, 0, fn, u);
+    return ctx_walk_script(s, n, 0, 0, 0, fn, u);
+}
+
+static int ctx_ld_entry(const char* s, size_t n, int64_t line, void* u) {
+    ray_t** cols = (ray_t**)u;
+    ray_t*  text = ray_charv(s, (int64_t)n);
+    if (!text || RAY_IS_ERR(text)) return 1;
+    cols[0] = ray_vec_append(cols[0], &line);
+    cols[1] = ray_list_append(cols[1], text);
+    ray_release(text);
+    return !cols[0] || RAY_IS_ERR(cols[0]) || !cols[1] || RAY_IS_ERR(cols[1]);
+}
+
+ray_t* q_ctx_ld_fn(ray_t* x) {
+    const char* p;
+    int64_t     n;
+    if (!q_str_text_bytes(x, &p, &n)) return q_err(QE_TYPE);
+    ray_t* cols[2] = { ray_vec_new(RAY_I64, 8), ray_list_new(8) };
+    ray_t* out     = NULL;
+    int    ok      = cols[0] && !RAY_IS_ERR(cols[0]) && cols[1] && !RAY_IS_ERR(cols[1]);
+    if (ok && !ctx_walk_script(p, (size_t)n, 0, 0, 1, ctx_ld_entry, cols)) {
+        out = ray_list_new(2);
+        out = ray_list_append(out, cols[0]);
+        out = ray_list_append(out, cols[1]);
+    }
+    for (int i = 0; i < 2; i++) {
+        if (RAY_IS_ERR(cols[i])) ray_error_free(cols[i]);
+        else ray_release(cols[i]);
+    }
+    if (out && !RAY_IS_ERR(out)) return out;
+    ray_error_free(out);
+    return q_err(QE_OOM);
 }
 
 /* docs/text-entry-law.md: the IPC column */
 ray_t* q_ctx_eval_src(const char* s, size_t n) {
     ray_t* last = NULL;
-    int    rc   = ctx_walk_script(s, n, 0, 1, ctx_eval_stmt, &last);
+    int    rc   = ctx_walk_script(s, n, 0, 1, 0, ctx_eval_stmt, &last);
     if (last) return last;
     if (rc) return q_err(QE_OOM);          /* the one non-statement stop: the walker's own buffer */
     ray_retain(RAY_NULL_OBJ);              /* no statement ran: what an assignment answers */
@@ -540,27 +599,64 @@ static const char* ctx_known_file(const char* p, int64_t n) {
 static FILE* g_console_out;   /* the load in progress's streams: what `.pq.i.console` prints to; NULL = stdout/stderr */
 static FILE* g_console_err;
 
-/* `.pq.i.console` — see q_ctx.h: prompt and input echo (none under `-q`, as
- * the piped console), then the line as the console runs it — `.z.pi`,
- * display, an error printed and the run continuing.  Never suspends (a
- * transcript's expected answer is often an error), never a history record
- * (nobody typed it), and at top level: a transcript's `a:1` is the session's. */
-static ray_t* pq_console_fn(ray_t* x) {
-    const char* p; int64_t n;
-    if (!q_str_text_bytes(x, &p, &n)) return q_err(QE_TYPE);
+/* The transcript's `q))` lines, served to the debugger a line of it suspends into: the console's reader while that
+ * line runs.  One slot: a served line that loads another transcript saves and restores it. */
+typedef struct { ray_t* lines; int64_t next, count; FILE* out; } ctx_qcmd_t;
+static ctx_qcmd_t g_qcmd;
+
+static void ctx_qcmd_echo(const char* prompt, const char* p, size_t n, FILE* out) {
+    if (q_dotz_quiet()) return;
+    fputs(prompt, out);
+    fwrite(p, 1, n, out);
+    fputc('\n', out);
+    fflush(out);
+}
+
+static int64_t ctx_qcmd_text(int64_t i, const char** p) {
+    ray_t* ln = ray_list_get(g_qcmd.lines, i);
+    int64_t n = 0;
+    *p = "";
+    if (ln) q_str_text_bytes(ln, p, &n);
+    return n;
+}
+
+/* q_dbg_read_fn: the next q)) line under the LIVE prompt (the transcript's own depth is not consulted — the echo
+ * shows where the replay really is); -1 once they are spent, so the suspension unwinds and the next q) line runs
+ * at top level.  The tail of a line past the buffer is dropped. */
+static int ctx_qcmd_read(const char* prompt, char* buf, size_t cap) {
+    if (!prompt) return 0;
+    if (g_qcmd.next >= g_qcmd.count) return -1;
+    const char* p;
+    int64_t n = ctx_qcmd_text(g_qcmd.next++, &p);
+    if ((size_t)n >= cap) n = (int64_t)cap - 1;
+    ctx_qcmd_echo(prompt, p, (size_t)n, g_qcmd.out);
+    memcpy(buf, p, (size_t)n);
+    buf[n] = '\0';
+    return (int)n;
+}
+
+/* `.pq.i.console[x;nested]` — see q_ctx.h: prompt and input echo (none under `-q`, as the piped console), then the
+ * line as the console runs it — `.z.pi`, display, an error suspending into the debugger with `nested` (the
+ * transcript's following `q))` lines) as its input, else printed and the run continuing.  Never a history record
+ * (nobody typed it), and at top level: a transcript's `a:1` is the session's.  A q)) line the replay did not need
+ * (it never suspended, or `\` left early) is echoed under the live prompt and NOT run: its row fails on the prompt,
+ * the rows after it stay paired, and a `\` meant for the debugger never toggles the session into k. */
+static ray_t* pq_console_fn(ray_t* x, ray_t* nested) {
+    const char* p = ""; int64_t n = 0;
+    int head = q_str_text_bytes(x, &p, &n);   /* x = `::`: no q) line — a transcript opening at q)) */
+    if (!head && x != RAY_NULL_OBJ) return q_err(QE_TYPE);
+    if (!nested || nested->type != RAY_LIST) return q_err(QE_TYPE);
     FILE* out = g_console_out ? g_console_out : stdout;
     FILE* err = g_console_err ? g_console_err : stderr;
-    if (!q_dotz_quiet()) {
-        char prompt[80];
-        int  pl = q_sys_prompt(prompt, sizeof prompt);
-        fwrite(prompt, 1, (size_t)pl, out);
-        fwrite(p, 1, (size_t)n, out);
-        fputc('\n', out);
-        fflush(out);   /* a terminal shows the echo before anything the line writes to stderr */
-    }
+    char prompt[Q_SYS_PROMPT_CAP];
+    q_sys_prompt(prompt, sizeof prompt);
+    if (head) ctx_qcmd_echo(prompt, p, (size_t)n, out);   /* a terminal shows the echo before anything the line writes to stderr */
+    ctx_qcmd_t saved = g_qcmd;
+    g_qcmd = (ctx_qcmd_t){ nested, 0, q_count(nested), out };
+    q_dbg_read_fn reader = q_dbg_set_reader(ctx_qcmd_read);
     if (n) {
         char* s = (char*)ray_sys_alloc((size_t)n + 1);   /* q_parse reads a C string */
-        if (!s) return q_err(QE_OOM);
+        if (!s) { q_dbg_set_reader(reader); g_qcmd = saved; return q_err(QE_OOM); }
         memcpy(s, p, (size_t)n);
         s[n] = '\0';
         ctx_line_t      prev   = g_line;
@@ -569,21 +665,29 @@ static ray_t* pq_console_fn(ray_t* x) {
         int64_t         conn   = __VM ? __VM->ipc_handle : -1;
         if (__VM) __VM->ipc_handle = -1;           /* the console's handle context: .z.w 0i, as `0 x` sets it */
         g_line.s = NULL;
-        ctx_line(s, (size_t)n, out, err, 1, 0, 0, 0, NULL);
+        ctx_line(s, (size_t)n, out, err, 1, 0, 1, 0, NULL);
         if (__VM) __VM->ipc_handle = conn;
         q_dbg_frame_base(base);
         g_line = prev;
         q_eval_frames_resume(frames);
         ray_sys_free(s);
     }
+    q_dbg_set_reader(reader);
+    q_sys_prompt(prompt, sizeof prompt);
+    for (; g_qcmd.next < g_qcmd.count; g_qcmd.next++) {
+        const char* lp;
+        int64_t     ln = ctx_qcmd_text(g_qcmd.next, &lp);
+        ctx_qcmd_echo(prompt, lp, (size_t)ln, out);
+    }
+    g_qcmd = saved;
     fflush(out);
     ray_retain(RAY_NULL_OBJ);
     return RAY_NULL_OBJ;
 }
 
 void q_ctx_pq_register(void) {
-    ray_t* fn = ray_fn_unary(".pq.i.console", RAY_FN_NONE, pq_console_fn);
-    q_env_bind_native(".pq.i.console", fn, 1);
+    ray_t* fn = ray_fn_binary(".pq.i.console", RAY_FN_NONE, pq_console_fn);
+    q_env_bind_native(".pq.i.console", fn, 2);
     ray_release(fn);
 }
 
@@ -679,6 +783,7 @@ int q_ctx_run_named_src(const char* name, const char* s, FILE* out, FILE* err, r
 
 int q_ctx_run_console_src(const char* s, FILE* out, FILE* err) {
     int tok = q_dbg_statement_begin(s, strlen(s), 1);   /* the statement the load's lines inherit console-ness from */
+    q_dbg_statement_startup();
     int rc  = ctx_run_script(s, strlen(s), 0, 0, 0, out, err, NULL);   /* argv text: silent, as q_ctx_run_src */
     q_dbg_statement_end(tok);
     return rc;
@@ -687,6 +792,7 @@ int q_ctx_run_console_src(const char* s, FILE* out, FILE* err) {
 int q_ctx_run_load(const char* name, FILE* out, FILE* err) {
     size_t n   = strlen(name);
     int    tok = q_dbg_statement_begin(name, n, 0);
+    q_dbg_statement_startup();
     ray_t* r   = q_sys_load(name, n);
     int    rc  = r && RAY_IS_ERR(r);
     if (rc) ctx_show_err(out, err, r);
@@ -702,35 +808,51 @@ int q_ctx_run_load(const char* name, FILE* out, FILE* err) {
  * `value` of the message under the statement seam, answering over the wire instead of to `out`; errors propagate
  * as owned values the IPC layer serializes as -128h.  Console output is written to the SERVER's stdout as issued. */
 
-/* `\e` error-trap-CLIENTS mode (syscmds.md#e-error-trap-clients) applied to a
- * request: 1 = the statement is console-marked, so an error suspends on the
- * server's console (the parked event loop is what blocks other requests);
- * 2 = dump the stack to stderr for an untrapped error, still answer (V3.5). */
-static int remote_console(void)      { return q_sys_err_trap_mode() == 1 ? 1 : 0; }
-static void remote_err_dump(ray_t* r) {
-    if (r && RAY_IS_ERR(r) && q_sys_err_trap_mode() == 2)
-        q_dbg_print_trace(stderr, r);
-}
-
-/* docs/text-entry-law.md (target state; peachq may differ): IPC column; an IPC request's session.
- * A request with no .z.pg/.z.ps answers as handle 0, ONE `value` of the message (owner 2026-10-03): basics/ipc.md's
- * `h"fn:{2+x}"` answers nothing because `value` does.  Only source text has a `[0]` line to stash for `\e`. */
-static ray_t* remote_value(ray_t* msg) {
-    /* OWNER RULING 2026-08-10: restore `\d` on success (no client parks a shared server), not after an abort. */
+/* `\e` error-trap-CLIENTS mode (syscmds.md#e-error-trap-clients, debug.md §Error trap modes) governs every client
+ * callback — sync, async and HTTP, a handler's or handle 0's `value` (owner R5): 1 marks the statement console, so an
+ * error suspends on the server's console (the parked event loop is what blocks other requests); 2 dumps the stack
+ * to stderr, or into an HTTP caller's response; 0 aborts, an async error still showing its error line (no frames)
+ * on the server console (SO 64109959's default-mode `q)'type`).  The client is answered in every mode.  A handler call has no text: the handler is
+ * frame [0].  OWNER RULING 2026-08-10: `\d` is restored on success (no client parks a shared server), not after an
+ * abort. */
+ray_t* q_ctx_remote_call(ray_t* fn, ray_t* msg, int kind, char** trace, size_t* tn) {
     int64_t     saved_ctx = q_env_ctx();
+    int         mode = q_sys_err_trap_mode();
     const char* src = NULL;
     int64_t     len = 0;
-    (void)q_str_text_bytes(msg, &src, &len);   /* leaves them NULL/0 for a non-text message */
-    int    dbg_prev = q_dbg_statement_begin(src, (size_t)len, remote_console());
+    if (!fn) (void)q_str_text_bytes(msg, &src, &len);   /* leaves them NULL/0 for a non-text message */
+    int    dbg_prev = q_dbg_statement_begin(src, (size_t)len, mode == 1);
     FILE*  door     = q_console_door(stdout);
-    ray_t* r        = q_eval_value_wrap(msg);
+    ray_t* r;
+    q_ctx_callback_begin();
+    q_ctx_interrupt_take(1);                   /* a request is a client's seam: an idle SIGINT before it is served */
+    if (fn) {
+        ray_retain(fn);                        /* a body that rebinds its own name frees what we hold */
+        r = q_eval_apply_concrete(q_eval_apply_value(fn, &msg, 1));
+        ray_release(fn);
+    } else
+        r = q_eval_value_wrap(msg);
+    if (q_ctx_interrupt_take(0)) {               /* a SIGINT a kernel ran through answers THIS request, not the next */
+        if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r);
+        r = q_err(QE_STOP);
+    }
+    if (r && q_err_is(r, QE_STOP)) q_eval_interrupt_served();   /* the client receives it */
+    q_ctx_callback_end();
     q_console_door(door);
     ctx_statement_end();
-    remote_err_dump(r);                  /* `\e 2`: trace before the seam closes */
+    if (r && RAY_IS_ERR(r) && !q_dbg_reported(r) && (mode == 2 || kind == Q_CTX_ASYNC)) {
+        if (kind == Q_CTX_HTTP) *trace = q_dbg_trace(r, 1, tn);
+        else q_dbg_print_trace(stderr, r, mode == 2);
+    }
     q_dbg_statement_end(dbg_prev);
     if (!RAY_IS_ERR(r)) q_env_ctx_set(saved_ctx);
     return r;                            /* an error propagates as the -128h answer */
 }
+
+/* docs/text-entry-law.md (target state; peachq may differ): IPC column; an IPC request's session.
+ * A request with no .z.pg/.z.ps answers as handle 0, ONE `value` of the message (owner 2026-10-03): basics/ipc.md's
+ * `h"fn:{2+x}"` answers nothing because `value` does. */
+static ray_t* remote_value(ray_t* msg) { return q_ctx_remote_call(NULL, msg, Q_CTX_SYNC, NULL, NULL); }
 
 void q_ctx_install_remote_hooks(void) {
     ray_eval_set_remote_value_fn(remote_value);

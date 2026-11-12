@@ -7,6 +7,7 @@
 #define Q_EVAL_H
 
 #include <rayforce.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -14,6 +15,18 @@ struct q_op;
 
 /* Walker over the RAW q_parse tree; returns OWNED (RAY_ERROR on failure). */
 ray_t* q_eval(ray_t* node);
+
+extern volatile sig_atomic_t q_eval_stop_pending;   /* SIGINT → `'stop` (console-architecture); take = one load */
+int q_eval_interrupt_post(void);      /* the handler's: answers the unserviced count */
+int q_eval_interrupt_consume(void);
+void q_eval_interrupt_served(void);   /* a human or client saw the stop: the count restarts */
+int q_eval_active(void);              /* a statement is in the walker (0 at an event-loop callback's entry) */
+#define Q_EVAL_DEPTH_CEIL 2560          /* the walker's depth with every q)) reserve spent: the live-frame and env bounds */
+typedef struct { int cap; uintptr_t floor; } q_eval_reserve_t;
+q_eval_reserve_t q_eval_depth_reserve(void);   /* the debugger's headroom past the running depth and stack */
+void q_eval_depth_restore(q_eval_reserve_t r);
+int q_eval_stack_low(void);   /* the C stack is past its guard: a lambda application answers 'limit */
+static inline int q_eval_interrupt_take(void) { return q_eval_stop_pending ? q_eval_interrupt_consume() : 0; }
 
 /* Drop the walker's once-per-runtime fixed-sym-id cache (control-form and
  * adverb spellings).  q_runtime_destroy MUST call this: sym ids are not
@@ -25,10 +38,6 @@ void q_eval_syms_reset(void);
  * it dispatches into lives in q_adverb.c.  Args BORROWED (C-NULL = elided
  * hole), result OWNED; `row` is fv's manifest row when known, NULL otherwise. */
 ray_t* q_eval_apply(ray_t* fv, const struct q_op* row, ray_t** args, int64_t n);
-
-/* the same call for a parser-marked TRAIN node (Q_ATTR_TRAIN): the last arg is a deferred tail, so a unary head or
- * a noun-headed infix COMPOSES onto it (`1~count@`, `(1b;)@-9!`); anything else applies as q_eval_apply would */
-ray_t* q_eval_apply_train(ray_t* fv, const struct q_op* row, ray_t** args, int64_t n);
 
 /* THE materialization boundary (materialization phase 1, design 2026-07-24):
  * the ONE home for the force operation.  A lazy DAG handle is forced to a
@@ -105,6 +114,10 @@ int q_eval_apply_truthy(ray_t* v, ray_t** err);
  * carrier) — the q_deriv_is_fn_value successor. */
 int q_eval_apply_is_fn(ray_t* v);
 
+/* native fn VALUE (RAY_UNARY/BINARY/VARY) — narrower than q_eval_apply_is_fn,
+ * which also admits carriers and engine lambdas */
+int q_eval_apply_is_fnval(ray_t* v);
+
 /* RAY_QFN carriers (lambda/projection/derived verb/composition): child
  * slots in ray_data, kind in aux[0]; serde/wire refuse them via totality
  * fallbacks.  NAMED so -Wswitch fails the build on a switch missing an arm. */
@@ -123,10 +136,12 @@ int    q_eval_apply_kfn_parts(ray_t* v, void** fn, int64_t* rank, int64_t* lib_s
  * pointer's own destructor runs on the last reference through the heap's RAY_QFN finalizer hook. */
 ray_t* q_eval_apply_foreign_new(void* obj);
 int    q_eval_apply_foreign_parts(ray_t* v, void** obj);
-/* types: i64 vector of declared kdb type nums parallel to params (0 = untyped
- * slot), or NULL for an undecorated lambda; checked exactly on entry ('type) */
+/* types: i64 vector of declared kdb type nums parallel to params (0 = untyped slot), NULL for an undecorated
+ * lambda, checked exactly on entry ('type); pats: general list parallel to params, a destructured slot's pattern
+ * tree (q_pattern.h) or the generic null, NULL when no slot destructures; pos: the parser's caret table, i64 (node
+ * pointer; head-token offset) pairs */
 ray_t* q_eval_apply_lambda_new(ray_t* params, ray_t** body, int64_t nbody,
-                               ray_t* src, ray_t* types);
+                               ray_t* src, ray_t* types, ray_t* pats, ray_t* pos);
 ray_t* q_eval_apply_deriv_new(int adv, ray_t* fv, const struct q_op* frow);
 /* An iterator IS a value (103h, basics/datatypes.md); a derived function is
  * that value applied to its ONE operand.  `_iter_id` reads the adverb id
@@ -161,6 +176,7 @@ void q_eval_apply_lambda_origin(ray_t* v, int64_t file_sym, int64_t line);
 void q_eval_apply_lambda_name(ray_t* v, const char* name, int64_t nn);
 int  q_eval_apply_lambda_prov(ray_t* v, ray_t** name, int64_t* file_sym,
                               int64_t* line);
+ray_t* q_eval_apply_lambda_pos(ray_t* v);           /* BORROWED caret table, NULL when none */
 
 /* Carrier read-out for display (q_fmt renders; slot layout stays opaque):
  * BORROWED parts, NULL when v is not that carrier kind — deriv/proj head

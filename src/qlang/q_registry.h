@@ -83,7 +83,8 @@ ray_t* q_registry_lookup_row(int64_t sym_id, q_valence_t valence,
                              const struct q_op** row_out);
 
 /* Manifest row for a PARSER-EMBEDDED head value at the given valence.
- * Exact for wrapper/QSRC cells (unique objects).  A pass-through env value
+ * Exact for wrapper/QSRC cells unique to one row; a primitive several rows
+ * share answers the row registry.c's row_prefer picks.  A pass-through env value
  * aliased by several rows at that valence returns NULL — ambiguous by
  * construction (the `#`-monadic vs `count` class); the fresh apply module
  * then dispatches on the value's own attrs (RAY_FN_ATOMIC) alone. */
@@ -95,8 +96,8 @@ const struct q_op* q_registry_row_of(const ray_t* value, q_valence_t valence);
  * the container lift the per-item apply needs (`sum each t`). */
 const struct q_op* q_registry_operand_row(const ray_t* value);
 
-/* True iff sym_id is a manifest row (any valence, values or not) or a syntax word.  O(1), for the lexical assign
- * gates — what they make of it is theirs.  False before q_registry_init. */
+/* True iff sym_id is a manifest row (any valence, values or not), a syntax word or, once sealed, a q.q builtin `.q`
+ * name.  O(1), for the lexical assign gates — what they make of it is theirs.  False before q_registry_init. */
 int q_registry_is_reserved(int64_t sym_id);
 
 /* True iff sym_id is one of the `.Q.res` syntax words — the `SYNTAX_WORDS[]` roster, reached by q_ops_syntax_word. */
@@ -109,8 +110,17 @@ void q_registry_seal(void);
 bool q_registry_sealed(void);
 
 /* True iff sym_id is a reserved word or a builtin `.q` name, once sealed.  Callers apply it: q_env_set to a root or
- * `.q.<sym_id>` target (and to each entry of a whole-`.q` write), q_eval to a bare global `name:` spelling. */
+ * `.q.<sym_id>` target (and to each entry of a whole-`.q` write). */
 int q_registry_locked(int64_t sym_id);
+
+/* THE keyword lookup the parser binds by: a manifest verb's value (the monadic cell, else the dyadic), else the `.q`
+ * entry of that name (a q.q builtin, or a user extension once sealed), BORROWED; NULL for any other name. */
+ray_t* q_registry_keyword(int64_t sym_id);
+
+/* A USER `.q` entry (a key of the live `.q` that is no builtin): its value, BORROWED; NULL otherwise and before the
+ * seal.  Such a name is a keyword from the moment it exists: the parser binds it and every `name:` spelling of it is
+ * refused, so a call never consults `.q`. */
+ray_t* q_registry_dotq_ext(int64_t sym_id);
 
 /* The infix rule: s[0..n) is infix iff its `.q` entry has rank >= 2.  A keyword's entry is the immutable
  * registry value, so the manifest answers for it; any other name is a pure probe of `.q` that interns nothing. */
@@ -126,6 +136,15 @@ ray_t* q_registry_row_value(const struct q_op* row, q_valence_t valence);
  * (its value is the extension itself, so applying that would recurse), else the row's monadic value (`sum`).
  * Borrowed; NULL when the row has no monadic cell. */
 ray_t* q_registry_row_kernel(const struct q_op* row);
+
+/* The C kernel a cover or composition row runs when its structured value is applied at this valence (`<>` is
+ * `'[not;=]`, its dyadic kernel q_ne_wrap); NULL when the row has none there.  Borrowed. */
+ray_t* q_registry_row_kernel_at(const struct q_op* row, q_valence_t valence);
+
+/* The registry carrier that fresh, a just-built composition, projection or derived function (its carrier kind and
+ * slot-0 head passed in, as the constructor has them), structurally IS (a user's `'[not;=]` is `<>`), so every
+ * construction of a keyword's structure is the one registry value.  Borrowed; NULL when fresh matches none. */
+ray_t* q_registry_intern_carrier(ray_t* fresh, int kind, ray_t* head);
 
 /* THE fn-value -> kdb primitive code home (`value +` and the wire's 101h/102h
  * byte share it): the value's manifest row's kdb_op column, falling back for an
@@ -147,7 +166,8 @@ ray_t* q_registry_kdb_op_value(int code, q_valence_t valence);
  * Returns true and fills *out on a hit; false if `value` is not a registry
  * value.  Consumed by the 2b formatter to print the original q glyph.
  *
- * EXACT for WRAPPER values (unique objects).  Pass-through/rename values are the
+ * For a WRAPPER value, the first row registered with it (a shared primitive's
+ * glyph: `neg` names `-`).  Pass-through/rename values are the
  * shared env builtin object, and several q spellings may alias one env object
  * (e.g. `#`-monadic and `count`); for those, this returns the first-registered
  * spelling — 2b disambiguates aliased pass-throughs from the parse-site glyph,

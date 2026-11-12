@@ -25,9 +25,11 @@
 #define RAY_EVAL_H
 
 #include <rayforce.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include "lang/nfo.h"
+#include "core/platform.h"   /* RAY_INLINE */
 
 /* ===== Function Attribute Flags (stored in attrs byte) ===== */
 
@@ -268,9 +270,20 @@ ray_t* ray_div_fn(ray_t* a, ray_t* b);
 ray_t* ray_idiv_fn(ray_t* a, ray_t* b);
 ray_t* ray_mod_fn(ray_t* a, ray_t* b);
 
-/* Comparison — the tolerant-equality predicate (E=2^-43, cmp.c) shared by =/<>/orderings,
- * q `~` (q_match_rec) and the DAG constant fold; float lanes only, gated by the caller. */
-int ray_cmp_tol_eq(double x, double y);
+/* Comparison tolerance E=2^-43 (qdocs basics/precision.md): x=y iff |x-y| <= E*max(|x|,|y|),
+ * shared by =/<>/orderings, q `~` (q_match_rec), the DAG constant fold and the vector lanes;
+ * applied only where an operand is real/float/datetime, gated by the caller.  Infinities
+ * compare exactly (±0w=±0w; the law covers FINITE floats), a NaN equals nothing.  This is the
+ * exact inequality, NOT the integer-ULP approximation: ULP is a superset at binade bottoms, so
+ * it cannot be swapped in without re-checking the pinned band grid in
+ * test/q/aigenerated/compare_tolerance.qcmd.  Forced inline and branch-free (no early
+ * return, no fmax): the vector lanes call it inside loops that must vectorize, and GCC's
+ * early inliner otherwise leaves the call in place until after the vectorizer has run. */
+RAY_INLINE int ray_cmp_tol_eq(double x, double y) {
+    double ax = fabs(x), ay = fabs(y);
+    int finite = (!isinf(x)) & (!isinf(y));
+    return (x == y) | (finite & (fabs(x - y) <= 0x1p-43 * (ax > ay ? ax : ay)));
+}
 ray_t* ray_gt_fn(ray_t* a, ray_t* b);
 ray_t* ray_lt_fn(ray_t* a, ray_t* b);
 ray_t* ray_gte_fn(ray_t* a, ray_t* b);
@@ -326,9 +339,11 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx);
 ray_t* ray_find_fn(ray_t* vec, ray_t* val);
 /* Find over rows.  dom: k columns of one length; probe: k columns of length m or 1 (broadcast).  ray_find_rows_fn:
  * the smallest domain row equal to each probe row, 0N for a miss (an I64 vector of m).  ray_find_rows_class_fn:
- * every such row per probe row in row order (a list of m I64 vectors).  Columns borrowed; owned result or error. */
-ray_t* ray_find_rows_fn(ray_t* const* dom, ray_t* const* probe, int64_t k, int64_t m);
-ray_t* ray_find_rows_class_fn(ray_t* const* dom, ray_t* const* probe, int64_t k, int64_t m);
+ * every such row per probe row in row order (a list of m I64 vectors).  Columns borrowed; owned result or error.
+ * eq decides a pair of cells where either column is boxed: the caller's sameness for a nested value. */
+typedef int (*ray_cell_eq_t)(ray_t* a, ray_t* b);
+ray_t* ray_find_rows_fn(ray_t* const* dom, ray_t* const* probe, int64_t k, int64_t m, ray_cell_eq_t eq);
+ray_t* ray_find_rows_class_fn(ray_t* const* dom, ray_t* const* probe, int64_t k, int64_t m, ray_cell_eq_t eq);
 ray_t* ray_til_fn(ray_t* x);
 ray_t* ray_reverse_fn(ray_t* x);
 

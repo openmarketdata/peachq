@@ -3,23 +3,39 @@
 / dotq.q (which may use these names, never the reverse).  See q_runtime.c.
 
 / ---- wave 1 (ref/reciprocal.md, ref/next.md) ----
-.q.reciprocal:%[1;]
-.q.prev:xprev[1;]
-.q.next:xprev[-1;]
+.q.reciprocal:(%:)
+.q.next:{-1 xprev x}
 
 / ---- wave 2 ----
 / prefix keywords (no manifest row; bare name resolves via .q)
 .q.rand:{first 1?x}
 / a variadic keyword that covers an extension IS it, unary and binary-bracket alike (basics/exposed-infrastructure.md:72-113)
 .q.deltas:(-':)
-.q.differ:('[not;~':])
-/ the covers with a QR_COVER manifest row: the row keeps the name reserved and names the unary C kernel (ref/raze.md:50)
+/ ref/value.md:89-92: value differ is $["b"] and ~~':
+.q.differ:('["b"$;not;~':])
+/ the covers with a QR_COVER manifest row: the value is kdb's, the row keeps the name reserved and names the C kernel
+/ the apply module runs when the value is applied (ref/raze.md:50, exposed-infrastructure.md:72)
 .q.sums:(+\)
 .q.prds:(*\)
 .q.maxs:(|\)
 .q.mins:(&\)
 .q.raze:(,/)
 .q.ratios:(%':)
+/ kdb-written bytes W-EXX-091
+.q.prev:(:':)
+/ ref/fill.md:136
+.q.fills:(^\)
+/ docs-v1 ref/logic.md:15,43; kdb-written bytes W-EXX-087
+.q.any:('[max;"b"$])
+.q.all:('[min;"b"$])
+/ ref/union.md:18: distinct x,y
+.q.union:('[distinct;,])
+/ wp/permissions/index.md:387
+.q.upsert:(.[;();,;])
+/ basics/internal.md:15
+.q.attr:(-2!)
+/ the parts are inferred from the kdb-written 105h type byte: the least integer not below x
+.q.ceiling:('[neg;floor;neg])
 / ref/md5.md: verbatim q.k spelling - the -15! internal fn (q_bang.c -> q_md5_fn)
 .q.md5:(-15!)
 / ref/hcount.md: file size in bytes - the -7! internal fn (q_bang.c -> h_hcount)
@@ -41,7 +57,7 @@
 .q.sublist:{$[2=count x;x[0]_((sum x)&count y)#y;0<=x;(x&count y)#y;(max 0,x+count y)_y]}
 / ref/sum.md "equivalent to {sum x*y}", float ONLY "when both x and y are
 / integer lists" - an atom operand is not a list, so it never promotes
-.q.wsum:{sum x*$[all (type x;type y)in 5 6 7h;"f"$y;y]}
+.q.wsum:{sum x*$[(type x)in 5 6 7h;$[(type y)in 5 6 7h;"f"$y;y];y]}
 .q.cov:{x:"f"$x; y:"f"$y; avg[x*y]-avg[x]*avg y}
 .q.scov:{cov[x;y]*count[x]%-1+count x}
 .q.mavg:{(x msum y)%x mcount y}
@@ -66,27 +82,20 @@
 .q.xrank:{(x*rank y) div count y}
 / ref/asc.md: by the first column given, then the second within it = the grade of the named
 / columns, then ONE gather.  y a SYMBOL updates in place, returns the name (set returns its
-/ target).  t@/:x throws 'domain on a bad column - (flip t)x misses silently and truncates.
+/ target).  A bad column is 'domain - t@/:x would answer the first column's empty and truncate.
 / asc.md:189 - the sorted attribute is set on the FIRST column given; xdesc sets none.  No columns: t unchanged.
-.q.xasc:{[x;y]$[-11h=type y;y set .q.xasc[x;get y];.Q.ft[{[x;t]x:$[0h>type x;1#x;x];$[count x;@[t iasc flip x!t@/:x;first x;.Q.c.sorted];t]}[x;];y]]}
-.q.xdesc:{[x;y]$[-11h=type y;y set .q.xdesc[x;get y];.Q.ft[{[x;t]x:$[0h>type x;1#x;x];$[count x;t idesc flip x!t@/:x;t]}[x;];y]]}
+.q.xasc:{[x;y]$[-11h=type y;y set .q.xasc[x;get y];.Q.ft[{[x;t]x:$[0h>type x;1#x;x];if[not all x in cols t;'domain];$[count x;@[t iasc flip x!t@/:x;first x;.Q.c.sorted];t]}[x;];y]]}
+.q.xdesc:{[x;y]$[-11h=type y;y set .q.xdesc[x;get y];.Q.ft[{[x;t]x:$[0h>type x;1#x;x];if[not all x in cols t;'domain];$[count x;t idesc flip x!t@/:x;t]}[x;];y]]}
 
 / ---- wave 3 (ref/cols.md) ----
 / lifted via .Q.ft (defined later, in dotq.q - a lambda resolves it at call time);
 / names pair with the unchanged column values, so a bad rename/reorder goes ragged
 / at `!` and throws its own 'length (ref/cols.md: nonexistent key x -> 'length)
-.q.xcol:{[x;y] .Q.ft[{[x;t] c:cols t; flip ($[99h=type x;{[c;m](c^m c),(key m)except c}[c;$[98h=type key x;first each flip key x;x]];x,(count x)_c])!value .Q.V t}[x;];y]}
-.q.xcols:{[x;y] .Q.ft[{[x;t] c:cols t; n:x,c except x; flip n!(.Q.V t) n inter c}[x;];y]}
+.q.xcol:{[x;y] .Q.ft[{[x;t] c:cols t; flip ($[99h=type x;{[c;m] w:where c in k:key m; @[c;w;:;m c w],k except c}[c;$[98h=type key x;first each flip key x;x]];x,(count x)_c])!value .Q.V t}[x;];y]}
+/ a dictionary's keys stand for the columns (TorQ dataaccess/queryorder.q:41; owner 2026-11-09)
+.q.xcols:{[x;y] $[(99h=type y)&not .Q.qt y;{[x;d] k:key d; n:x,k except x; n!d n inter k}[x;y];.Q.ft[{[x;t] flip .q.xcols[x;.Q.V t]}[x;];y]]}
 
 / ---- wave 4: verbs with no kernel to lose ----
-/ ref/all-any.md: CAST then fold - (&/)1 2 3 is 1 (a raw min), but `all 1 2 3` is 1b.
-/ Three arms the fold cannot serve: 98h table "iterates over its columns and returns a
-/ dictionary" (flip gives the 99h dict; each gives the doc's shape); an atom cast is an
-/ atom ("a nonzero atom" -> 1b) and folding an atom throws; the empty list is the fold's
-/ identity ("this includes the empty list" -> 1b).  Sym/GUID exclusion is the cast's own
-/ 'type, never a hand-written gate.  Bare all/any recurse via .q at call time.
-.q.all:{$[98h=type x;all each .Q.V x;0h>type b:"b"$x;b;0=count b;1b;(&/)b]}
-.q.any:{$[98h=type x;any each .Q.V x;0h>type b:"b"$x;b;0=count b;0b;(|/)b]}
 / ref/tables.md "default is root namespace" - and bare `system"a"` lists the CURRENT
 / context, so [] must pass `. itself.  f[] binds x to :: , and the kdb null-test
 / idiom `(::)~x` is the one total test.  A bad namespace throws \a's own error.
@@ -103,4 +112,11 @@
 .q.save:{f:{p:"." vs last "/" vs 1_string h:hsym x;$[2>count p;h set get `$"." sv p;not (e:`$last p) in key .h.tx;'e;4h=type r:.h.tx[e] get `$"." sv -1_p;h 1: r;h 0: r]};$[-11h=type x;f x;11h=type x;f each x;'`type]}
 / ref/load.md: `load `t` is `t:get `:t` - the file's name IS the global's, and the name is
 / returned; a filesymbol names the same global.  The directory-recursion arm is deferred.
-.q.load:{f:{h:hsym x;(`$last "/" vs 1_string h) set get h};$[-11h=type x;f x;11h=type x;f each x;'`type]}
+.q.load:{(`$last "/" vs 1_string h) set get h:hsym x}'
+/ ref/save.md rsave, ref/load.md rload: a table name and the splayed directory of the same name; ref/dsave.md: each
+/ table enumerated against the root (the first item of x), `p# on its first column, splayed under the path x
+.q.rsave:{(`$":",string[x],"/") set get x}'
+.q.rload:{$[-11h=type x;x set get `$":",string[x],"/";'`type]}'
+.q.dsave:{[x;y] t:.Q.en[first x] get y; (` sv x,y,`) set @[t;first cols t;`p#]; y}/:
+/ basics/internal.md: reval is the -24! internal
+.q.reval:(-24!)

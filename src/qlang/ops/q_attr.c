@@ -30,11 +30,11 @@
  * never releases it. */
 char q_attr_letter(ray_t* v) {
     if (!v || RAY_IS_ERR(v)) return 0;
-    if (v->type == RAY_ENUM) return q_enum_attr(v);       /* letter rides the domain slot */
+    if (v->type == RAY_ENUM && !ray_index_has(v)) return q_enum_attr(v);   /* `s` rides the domain slot */
     if (v->type == RAY_TABLE || v->type == RAY_DICT ||    /* `s#t/`s#kt key table (set-attribute.md:35-37) */
         v->type == RAY_LIST)                              /* asc of a nested list carries s (asc.md:31-33) */
         return (v->attrs & RAY_ATTR_SORTED) ? 's' : 0;
-    if (!ray_is_vec(v)) return 0;
+    if (!ray_is_vec(v) && v->type != RAY_ENUM) return 0;
     if (ray_index_has(v)) {
         ray_index_t* ix = ray_index_payload(v->index);
         if (ix->markers & RAY_MARK_UNIQUE) return 'u';
@@ -223,7 +223,8 @@ void q_attr_store_keep(ray_t* r, const int64_t* pos, int64_t m) {
  * set the identity marker.  A SYMBOL vector is already id-coded, so its index
  * is the direct-addressed CODES kind (its build is the verify; the domain
  * pointer stays in place beside it).  Every other numeric vector — the float
- * family included — takes the hash, probed by the builder's canonical word.
+ * family and an enum's positions included — takes the hash, probed by the
+ * builder's canonical word.
  * The engine attach contract: *vp is
  * the caller's owned live vector, cow'd when shared; NULL on success, else an
  * owned RAW engine error with *vp untouched (the `#` door remaps it). */
@@ -237,7 +238,7 @@ static ray_t* attr_build(ray_t** vp, char letter) {
         ray_index_payload((*vp)->index)->markers |= mark;
         return NULL;
     }
-    if (!ray_is_vec(v) || ray_attr_numeric_class(v->type) < 0) return q_err(QE_TYPE);
+    if ((!ray_is_vec(v) && v->type != RAY_ENUM) || ray_attr_numeric_class(v->type) < 0) return q_err(QE_TYPE);
     bool ok = letter == 'u' ? (ray_attr_verify_distinct(v) && attr_no_dup_nulls(v))
             : letter == 'p' ? ray_attr_verify_contiguous(v) : true;
     if (!ok) return q_err(QE_DOMAIN);
@@ -291,15 +292,25 @@ static ray_t* attr_set_table_s(ray_t* y) {
 }
 
 /* `s#` on a KEYED table stamps the KEY table IN PLACE (set-attribute.md:63 — why the :35-37 pin sees
- * `s from an UNASSIGNED `s#t) and "copies the outer object" (:75), so the RESULT is a sorted dict
- * while the argument keeps its own attribute.  The key table's first column is NOT parted:
- * kb/serialization.md's keyed-table frame carries 00 there where the plain-table frame carries 03. */
-static ray_t* attr_set_keyed_s(ray_t* y) {
+ * `s from an UNASSIGNED `s#t), the outer dict untouched: a select-by result's own shape.  The key
+ * table's first column is sorted, not parted: q 5 writes it 0b 01 (community/wire/attributes.qcmd,
+ * Dcdmxr).  Borrows y; NULL, or the owned error. */
+ray_t* q_attr_sort_keyed_key(ray_t* y) {
     ray_t* kt = ray_dict_keys(y);                            /* borrowed key TABLE */
     if (!kt || kt->type != RAY_TABLE || ray_table_ncols(kt) < 1) return q_err(QE_TYPE);
     ray_t* c0 = ray_table_get_col_idx(kt, 0);
     if (!c0 || !non_descending(c0, 0, q_count(c0))) return q_err(QE_SFAIL);
     kt->attrs |= RAY_ATTR_SORTED;
+    c0->attrs |= RAY_ATTR_SORTED;
+    return NULL;
+}
+
+/* `s#kt` "copies the outer object" (set-attribute.md:75): the RESULT is a sorted dict, the argument's own
+ * dict keeps its attribute. */
+static ray_t* attr_set_keyed_s(ray_t* y) {
+    ray_t* e = q_attr_sort_keyed_key(y);
+    if (e) return e;
+    ray_t* kt = ray_dict_keys(y);
     ray_t* vals = ray_dict_vals(y);
     ray_retain(kt); ray_retain(vals);
     ray_t* d = ray_dict_new(kt, vals);                       /* consumes both */
@@ -349,11 +360,10 @@ static ray_t* attr_clear_container(ray_t* y) {
     return ray_dict_new(nk, vals);                           /* consumes both */
 }
 
-/* A 20h vector takes no letter yet: its domain pointer sits where the index
- * would (deferred 3, #558), so u/g/p would be a letter without a hash — 'nyi;
- * `s#` orders by RESOLVED value — recorded deferral, 'type.  `#` clears. */
+/* u/g/p on a 20h vector index its positions, the domain id staying beside the index;
+ * `s#` orders by RESOLVED value — recorded deferral (D0918g), 'type.  `#` clears. */
 static ray_t* attr_set_enum(char letter, ray_t* y) {
-    if (letter) return q_err(letter == 's' ? QE_TYPE : QE_NYI);
+    if (letter == 's') return q_err(QE_TYPE);
     ray_t* w;
     if (y->attrs & RAY_ATTR_SLICE) {                         /* a column VIEW: materialize */
         ray_t* pos = q_enum_positions(y);
@@ -364,7 +374,10 @@ static ray_t* attr_set_enum(char letter, ray_t* y) {
         w = ray_cow(y);                                      /* always copies (:29) */
     }
     if (!w || RAY_IS_ERR(w)) return w ? w : q_err(QE_OOM);
+    if (ray_index_has(w)) ray_index_drop(&w);
     (void)q_enum_attr_set(w, 0);
+    ray_t* e = letter ? attr_build(&w, letter) : NULL;
+    if (e) { ray_release(w); return attr_remap_err(e, letter); }
     return w;
 }
 
@@ -401,7 +414,7 @@ ray_t* q_attr_set_dispatch(ray_t* n, ray_t* vec) {
         return q_err(QE_TYPE);
     }
     if (vec && vec->type == RAY_ENUM)
-        return letter == '?' ? q_err(QE_TYPE) : attr_set_enum(letter, vec);
+        return letter && !strchr("supg", letter) ? q_err(QE_TYPE) : attr_set_enum(letter, vec);
     /* the empty general list holds no item to contradict a letter, so it takes any; a carrier it lacks drops */
     if (letter && strchr("supg", letter) && vec && vec->type == RAY_LIST && q_count(vec) == 0)
         return q_attr_rebuild(ray_cow(ray_attr_drop_fn(vec)), letter);

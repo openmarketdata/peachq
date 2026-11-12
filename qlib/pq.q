@@ -133,9 +133,9 @@
 .pq.i.resolveTree:{[cl;tree] (enlist tree 0),.pq.i.rnode[cl,`i] each 1_tree}
 
 .pq.i.q.bind:{[c;t] c ({[t] cols get t};t)};
-.pq.i.q.get:{[c;t] c (`get;t)};
-.pq.i.q.set:{[c;t;d] c (`set;t;d); t};
-.pq.i.q.upsert:{[c;t;d] c (`upsert;t;d); t};
+.pq.i.q.get:{[c;t] c (get;t)};
+.pq.i.q.set:{[c;t;d] c (set;t;d); t};
+.pq.i.q.upsert:{[c;t;d] c (upsert;t;d); t};
 .pq.i.q.hdel:{[c;t] c (!;`.;();0b;enlist t); t};
 .pq.i.q.qsql:{[c;cl;tree] c (?),.pq.i.resolveTree[cl;tree]};
 
@@ -184,7 +184,12 @@
   lines:$[10h=type lines; "\n" vs lines; lines];
   at:.pq.i.qcmd_prompt each lines;
   keep:where at>0;
-  .pq.i.console each at[keep] _' lines keep};
+  texts:at[keep] _' lines keep;
+  heads:where not texts like ")*";   / a q)) line is input to the debugger the q) line before it suspends into
+  texts:{x where maxs not x=")"} each texts;
+  lead:texts til first heads,count texts;
+  if[count lead; .pq.i.console[::;lead]];
+  {.pq.i.console[first x;1_x]} each heads cut texts};
 
 / The text as a q string literal's body (qStudio's KdbHelper.escape, in its order): backslash, tab, CR, LF, quote.
 .pq.i.remote_escape:{[text]
@@ -302,10 +307,11 @@
   (hsym `$file) set reply 1;
   };
 
-/ The launcher's connection under -conn: any hopen target as written - all digits a port, anything else the symbol -
-/ with the connect timeout; the handle, or hopen's own reason on stderr and exit 2.
+/ The launcher's connection under -conn: any hopen target as written - all digits a local port, anything else the
+/ symbol - with the connect timeout; the handle, or hopen's own reason on stderr and exit 2.  A port is spelled `::port:
+/ (port;timeout) is a long vector, which hopen (it IS <:) grades.
 .pq.i.conn_open:{[target]
-  where_to:$[(count target) and all target in .Q.n; "J"$target; `$target];
+  where_to:`$$[(count target) and all target in .Q.n; "::",target; target];
   @[hopen;(where_to;5000);{[target;err] -2 "q: cannot connect to ",target,": ",err; exit 2}[target]]};
 
 / One launcher call under -conn: a display, or with a file the last text's value saved and the earlier ones run

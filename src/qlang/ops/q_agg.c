@@ -1,5 +1,5 @@
 /* ops/q_agg.c — running/weighted/covariance/moving-window aggregates (wave 5),
- * the list-arm sum wrapper and the first/last index-miss adapters
+ * the list-arm sum wrapper, the first/last index-miss adapters and all/any
  *
  * Split from q_registry.c (2026-07-14) — pure function moves; the shared
  * internal surface lives in q_registry_internal.h.  See q_registry.h for
@@ -9,6 +9,8 @@
 #include "qlang/q_registry_internal.h" /* the split's shared surface — brings qlang/q_registry.h + qlang/q_ops.h */
 #include "qlang/base/q_err.h"
 #include "qlang/ops/q_index.h" /* q_index_at — first/last of an empty ride the miss law */
+#include "qlang/ops/q_dollar.h" /* q_dollar_cast — all/any read their argument as boolean */
+#include "qlang/eval/q_eval.h"  /* q_eval_apply_value — all/any apply min/max */
 #include "lang/eval.h"     /* ray_sum_fn, ray_avg_fn, ray_mul_fn, ray_first_fn, ray_last_fn — engine arms */
 #include "lang/internal.h" /* atomic_map_binary, make_f64, is_list, is_numeric, as_f64 */
 #include <math.h>          /* isnan, sqrt — sentinel-null discipline, mdev/cov */
@@ -50,6 +52,13 @@ double q_velem_f(ray_t* x, int64_t i, int* isnull) {
     default: *isnull = 1; return 0;
     }
 }
+/* an n-long result vector, or ray_vec_new's owned error untouched: setting len on
+ * that error would overwrite its code and the caller's writes would overrun it */
+static ray_t* agg_vec_out(int8_t type, int64_t n) {
+    ray_t* out = ray_vec_new(type, n > 0 ? n : 1);
+    if (!RAY_IS_ERR(out)) out->len = n;
+    return out;
+}
 int q_vec_is_float(ray_t* x) { return x->type == RAY_F64 || x->type == RAY_F32; }
 int q_vec_is_num(ray_t* x) {
     return x && (x->type==RAY_I64||x->type==RAY_I32||x->type==RAY_I16||
@@ -70,7 +79,7 @@ static void runscan_store_f(char* o, int esz, int64_t i, double v) {
  * "ggnnn") and u8 alike; bytes have no null, so no identity arm. */
 static ray_t* runscan_bytes(ray_t* x, q_rs_kind k) {
     int64_t n = q_count(x);
-    ray_t* out = ray_vec_new(x->type, n > 0 ? n : 1); out->len = n;
+    ray_t* out = agg_vec_out(x->type, n); if (RAY_IS_ERR(out)) return out;
     const uint8_t* p = (const uint8_t*)ray_data(x);
     uint8_t* o = (uint8_t*)ray_data(out);
     for (int64_t i = 0; i < n; i++) {
@@ -90,11 +99,13 @@ static ray_t* runscan(ray_t* x, q_rs_kind k) {
     }
     if ((k == RS_MAXS || k == RS_MINS) && ray_is_vec(x) && ray_is_bytelike(x->type))
         return runscan_bytes(x, k);
-    /* a char is not a number in arithmetic: `sums "abc"` is 'type (sum.md:113, owner ruling 2026-10-09) */
-    if (!ray_is_vec(x) || !q_type_is_num_tag(x->type)) return q_err(QE_TYPE);
+    /* a char is not a number in arithmetic: `sums "abc"` is 'type (sum.md:113, owner ruling 2026-10-09);
+     * a temporal is ordered, so maxs/mins keep it (max.md:65-66) */
+    int ordered = (k == RS_MAXS || k == RS_MINS) && ray_is_vec(x) && temporal_tag(x->type);
+    if (!ray_is_vec(x) || !(q_type_is_num_tag(x->type) || ordered)) return q_err(QE_TYPE);
     int64_t n = q_count(x);
     if (k == RS_AVGS) {
-        ray_t* out = ray_vec_new(RAY_F64, n > 0 ? n : 1); out->len = n;
+        ray_t* out = agg_vec_out(RAY_F64, n); if (RAY_IS_ERR(out)) return out;
         double* o = (double*)ray_data(out);
         double s = 0; int64_t c = 0;
         for (int64_t i = 0; i < n; i++) {
@@ -104,10 +115,10 @@ static ray_t* runscan(ray_t* x, q_rs_kind k) {
         }
         return out;
     }
-    int isf = q_vec_is_float(x);
+    int isf = q_vec_is_float(x) || RAY_IS_TEMPORALF(x->type);
     if (k == RS_MAXS || k == RS_MINS) {
         if (isf) {
-            ray_t* out = ray_vec_new(x->type, n > 0 ? n : 1); out->len = n;
+            ray_t* out = agg_vec_out(x->type, n); if (RAY_IS_ERR(out)) return out;
             char* o = (char*)ray_data(out);
             int esz = ray_elem_size(x->type);
             double m = (k == RS_MAXS) ? -INFINITY : INFINITY;   /* leading-null identity */
@@ -118,7 +129,7 @@ static ray_t* runscan(ray_t* x, q_rs_kind k) {
             }
             return out;
         }
-        ray_t* out = ray_vec_new(x->type, n > 0 ? n : 1); out->len = n;
+        ray_t* out = agg_vec_out(x->type, n); if (RAY_IS_ERR(out)) return out;
         char* o = (char*)ray_data(out);
         int esz = ray_elem_size(x->type);
         int64_t m = 0, inf = 0; int started = 0;
@@ -138,7 +149,7 @@ static ray_t* runscan(ray_t* x, q_rs_kind k) {
         return out;
     }
     if (isf) {
-        ray_t* out = ray_vec_new(x->type, n > 0 ? n : 1); out->len = n;
+        ray_t* out = agg_vec_out(x->type, n); if (RAY_IS_ERR(out)) return out;
         char* o = (char*)ray_data(out);
         int esz = ray_elem_size(x->type);
         double acc = (k==RS_PRDS) ? 1 : 0;
@@ -150,7 +161,7 @@ static ray_t* runscan(ray_t* x, q_rs_kind k) {
         return out;
     }
     int8_t ot = agg_sum_type(x->type);
-    ray_t* out = ray_vec_new(ot, n > 0 ? n : 1); out->len = n;
+    ray_t* out = agg_vec_out(ot, n); if (RAY_IS_ERR(out)) return out;
     void* o = ray_data(out);
     int64_t acc = (k==RS_PRDS) ? 1 : 0;
     for (int64_t i = 0; i < n; i++) {
@@ -171,7 +182,7 @@ ray_t* q_avgs_wrap(ray_t* x){ return runscan(x, RS_AVGS); }
 ray_t* q_ratios_wrap(ray_t* x) {
     if (!x || !ray_is_vec(x) || !q_type_is_num_tag(x->type)) return q_err(QE_TYPE);
     int64_t n = q_count(x);
-    ray_t* out = ray_vec_new(RAY_F64, n > 0 ? n : 1); out->len = n;
+    ray_t* out = agg_vec_out(RAY_F64, n); if (RAY_IS_ERR(out)) return out;
     double* o = (double*)ray_data(out);
     for (int64_t i = 0; i < n; i++) {
         int nu; double v = q_velem_f(x, i, &nu);
@@ -290,7 +301,7 @@ static ray_t* mwin(ray_t* nx, ray_t* x, q_mw_kind k) {
                  : k == MW_COUNT ? RAY_I64 : RAY_F64;
     if (!otype) return q_err(QE_TYPE);
     int fout = q_type_is_float_tag(otype) || RAY_IS_TEMPORALF(otype);
-    ray_t* out = ray_vec_new(otype, n > 0 ? n : 1); out->len = n;
+    ray_t* out = agg_vec_out(otype, n); if (RAY_IS_ERR(out)) return out;
     int oesz = ray_elem_size(otype);
     int64_t neg_inf = 0;
     ray_type_inf(otype, false, &neg_inf);
@@ -357,7 +368,7 @@ ray_t* q_ema_wrap(ray_t* a, ray_t* x) {
     }
     int64_t n = q_count(x);
     if (wv && q_count(a) != n) return q_err(QE_LENGTH);
-    ray_t* out = ray_vec_new(RAY_F64, n > 0 ? n : 1); out->len = n;
+    ray_t* out = agg_vec_out(RAY_F64, n); if (RAY_IS_ERR(out)) return out;
     double* o = (double*)ray_data(out);
     double e = 0;
     for (int64_t i = 0; i < n; i++) {
@@ -431,3 +442,17 @@ ray_t* q_avg_wrap(ray_t* x) {
     }
     return ray_avg_fn(x);
 }
+
+/* `all x` is `min "b"$x` and `any x` is `max "b"$x` (docs-v1 ref/logic.md:15,43): every container, empty and type
+ * rule is the one min, max and the boolean cast already have. */
+static ray_t* bool_extreme(ray_t* x, const char* name) {
+    ray_t* b = q_dollar_cast(RAY_BOOL, x);
+    if (!b || RAY_IS_ERR(b)) return b ? b : q_err(QE_TYPE);
+    ray_t* f = q_registry_lookup_name(name, 3, Q_MONADIC);   /* borrowed */
+    ray_t* r = f ? q_eval_apply_value(f, &b, 1) : q_err(QE_TYPE);
+    ray_release(b);
+    return r;
+}
+
+ray_t* q_all_wrap(ray_t* x) { return bool_extreme(x, "min"); }
+ray_t* q_any_wrap(ray_t* x) { return bool_extreme(x, "max"); }

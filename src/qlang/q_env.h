@@ -1,8 +1,10 @@
 /* q_env — q's OWN name surface: the K-tree as NESTED DICTS
  * (basics/namespaces.md: "Namespaces are implemented as dictionaries").
  * Three directory dicts — root variables (`.`), top-level namespaces (``),
- * and a hidden bootstrap-builtin shed — each carrying the ` -> :: marker
- * whose job is to keep the value slot a general RAY_LIST: a collapsed
+ * and a hidden bootstrap-builtin shed.  Every namespace below the root carries
+ * the ` -> :: marker (its back-reference, basics/namespaces.md:76-79); the root
+ * carries none and is a namespace by identity.  A general RAY_LIST value slot
+ * is what keeps a dict traversable: a collapsed
  * (typed-value) dict is NOT traversable, so `.foo:`p`q!7 8` makes `.foo.q`
  * a 'name — dotted access is value traversal, never name splitting.
  * Rayfall's env (src/lang/env.c) is a bootstrap-only kernel catalogue; q's
@@ -78,6 +80,9 @@ ray_err_t q_env_settle(int64_t sym, int stole, ray_t* val);
  * suspended for the call (the suspension fresh text already gets) and restored on every exit.  Contracts as their
  * bare-name twins: _get borrowed or NULL, _resolve owned (the full walk), _take/_settle/_bind the park protocol. */
 ray_t*    q_env_handle_get(int64_t sym);
+/* _get without the library autoload: the probe a by-name WRITE (amend, insert, upsert) makes, since a write never
+ * loads a library (platform-architecture.md). */
+ray_t*    q_env_handle_peek(int64_t sym);
 ray_t*    q_env_handle_resolve(int64_t sym);
 ray_err_t q_env_handle_set(int64_t sym, ray_t* val);
 int       q_env_handle_take(int64_t sym, ray_t* cur);
@@ -87,7 +92,9 @@ ray_err_t q_env_handle_bind(int64_t sym, ray_t* val);
 int    q_env_ns_exists(int64_t path_sym);
 /* The member of namespace ns_sym spelled member[0..n), borrowed, or NULL — a pure probe that interns nothing. */
 ray_t* q_env_ns_probe(int64_t ns_sym, const char* member, size_t n);
-/* The stored namespace dict itself (marker included), retained for the
+/* The same probe by an already-interned member id. */
+ray_t* q_env_ns_member(int64_t ns_sym, int64_t member);
+/* The stored namespace dict itself (a child's marker included), retained for the
  * caller.  OWNED; NULL if the name is not bound to a dict. */
 ray_t* q_env_ns_view(int64_t path_sym);
 
@@ -117,9 +124,8 @@ int q_env_ident_ok(const char* p, size_t len);
 /* A `\d` context path without its leading dot: `a` or `a.b.c`, each segment an identifier. */
 int q_env_ctx_ok(const char* p, size_t len);
 
-/* The symbol that marks a dictionary as a NAMESPACE.  env's representation, so
- * env owns it: `key` strips it from the root (ops/q_key.c) and kdb prints it
- * for every other namespace (ref/key.md `key `.` beside `key `.q`). */
+/* The symbol that marks a child dictionary as a NAMESPACE (the root has none:
+ * ref/key.md `key `.` beside `key `.q`).  env's representation, so env owns it. */
 int64_t q_env_marker_sym(void);
 
 /* `key ``: the root's namespaces in creation order, `.z` excluded
@@ -146,8 +152,8 @@ int64_t q_env_scope_ctx(void);   /* the context a relative name resolves against
 ray_err_t q_env_frame_push(int barrier);
 void      q_env_frame_pop(void);
 ray_err_t q_env_local_set(int64_t sym, ray_t* val);
-ray_t*    q_env_local_get(int64_t sym);   /* TOP frame only; borrowed */
-int       q_env_local_take(int64_t sym, ray_t* cur);  /* q_env_take, TOP frame;
+ray_t*    q_env_local_get(int64_t sym);   /* the top frame, or the frame view's; borrowed */
+int       q_env_local_take(int64_t sym, ray_t* cur);  /* q_env_take on that frame;
                                                        * q_env_local_set puts back */
 int32_t   q_env_frame_depth(void);
 /* Read floor (< 0: floor at the current depth); returns the previous.  A
@@ -159,7 +165,7 @@ int32_t   q_env_frame_floor(int32_t floor);
 /* Debugger frame cursor (basics/debug.md navigation): ROOT the resolving walk at
  * frame `depth`; _OFF = the top frame, _NONE = no frame at all (console [0]).  A
  * frame push saves and clears it, so a call made from the debug prompt resolves
- * in its own scope.  READS only — q_env_local_set stays on the top frame. */
+ * in its own scope.  Local writes follow it too: `y:3` at q)) after `` ` `` sets that frame's y (Q4M §10.2.2). */
 #define Q_ENV_FRAME_VIEW_OFF  (-1)
 #define Q_ENV_FRAME_VIEW_NONE (-2)
 int32_t   q_env_frame_view(int32_t depth);

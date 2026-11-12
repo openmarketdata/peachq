@@ -12,14 +12,13 @@ struct q_op;
 
 #define APPLY_MAX_ARGS 60
 
+/* the tree node the walker is applying NOW — what a caret points at (q_dbg reads it per frame) */
+extern _Thread_local const ray_t* q_eval_node;
+
 /* projection carrier ctor: [fv, row box, slot0..slotR-1]; holes = C NULL;
  * args borrowed, result owned */
 ray_t* q_eval_apply_proj_new(ray_t* fv, const struct q_op* row, ray_t** args,
                              int64_t n, int64_t rank);
-
-/* native fn VALUE (RAY_UNARY/BINARY/VARY) — narrower than q_eval_apply_is_fn,
- * which also admits carriers and engine lambdas */
-int q_eval_apply_is_fnval(ray_t* v);
 
 /* q_list_collapse that CONSUMES l */
 ray_t* q_eval_apply_collapse(ray_t* l);
@@ -36,6 +35,7 @@ int q_eval_fn_value(ray_t* x);
 int q_eval_ctl_sym(int64_t id);
 /* a colon assignment's SPELLING lock — q_env_set judges only the re-rooted target */
 int q_eval_assign_locked(int64_t sym);
+int q_eval_global_assign_locked(int64_t sym);
 /* `x.field` as `field$x` for a dotted name the env walk missed — owned, or NULL to leave the name error */
 ray_t* q_eval_dot_cast(int64_t id);
 /* the parse-time locals of a lambda body, params excluded — OWNED symvec (ref/value.md `## Lambda`); built ONCE

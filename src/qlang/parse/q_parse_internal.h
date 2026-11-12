@@ -5,49 +5,24 @@
 #ifndef Q_PARSE_INTERNAL_H
 #define Q_PARSE_INTERNAL_H
 #include "qlang/parse/q_parse.h"
-#include "qlang/q_registry.h"
-#include <setjmp.h>
 
 /* ATTR_QUOTED: flag on a -RAY_SYM atom.  SET = literal symbol; CLEAR
  * (default) = name reference, resolved at eval.  Mirrors the definition in
  * src/lang/eval.h (0x20) — kept local so the parser needs no eval header. */
 #define Q_ATTR_QUOTED 0x20
 
-/* Q_ATTR_KEYLIST: flag on a 1-elem RAY_SYM VECTOR node — the 1-col table-literal
- * KEY LIST (q_parse.c table_lit_dict).  That node is byte-identical to the
- * enlisted-sym-ATOM constant (,`a — parsetrees.md:26 unwraps it), so this is the
- * only signal that the node is a genuine 1-NAME LIST and `!` must see list!list.
- * Numerically RAY_ATTR_HAS_NULLS — chosen because it has no display glyph and no
- * serde footprint; q_eval answers a fresh unmarked copy, so it never escapes into
- * values.  A node whose one sym is the NULL sym is never a key list. */
-#define Q_ATTR_KEYLIST 0x40
-
-/* Q_ATTR_TRAIN: flag on a RAY_LIST call node whose rightmost operand is a train tail — WRITTEN as a verb: a
- * postfix elision (`count@`, `-9!`, `x each`), a lone glyph (`0|+`), an iterator-suffixed expression (`neg\`) or a
- * node so flagged — so `1~count@` composes `~[1;]` onto `count@` where the same tree built by hand, or by a bracket
- * elision (`count y[0;]`), applies; a keyword or lambda there (`3#{x}`) is a noun.  Only the parser knows the syntax,
- * so only the parser sets it; the walker reads it at the application arm, THE one composition home.  0x02 is
- * unclaimed on a general list (heap.h's legend gives it to -RAY_I64 atoms); the wire codec does not carry it, so a
- * serialised tree applies. */
-#define Q_ATTR_TRAIN 0x02
-
 /* Q_ATTR_POSTFIX: flag on the call node of a postfix elision (`2+`, `-15!`, `count@`): its trailing hole was never
  * WRITTEN, so the walker applies the head to the bound operand alone and the projection is `+[2]`'s (qPython's md5
- * fixture is two items) — parse still shows kdb's (+;2;::).  0x04 is unclaimed on a general list. */
+ * fixture is two items) — parse still shows kdb's (+;2;::).  On a `g::` train tail (::;g) it makes a function g the
+ * composition '[::;g].  0x04 is unclaimed on a general list. */
 #define Q_ATTR_POSTFIX 0x04
 
-/* A leading '_' is the drop/cut verb: no name or symbol constant begins with it (basics/syntax.md:601). */
+/* A leading '_' is the drop/cut verb: no name, and no first item of a symbol run, begins with it (basics/syntax.md:601). */
 static inline int q_parse_drop_lead(char c) { return c == '_'; }
 
-#define MAX_VEC  4096
 #define MAX_NAME 256
 
 /* ---- defined in q_parse.c ---- */
-ray_t *q_verb(char c);
-ray_t *q_verb_name(const char *s, int len);
-ray_t *q_embed(ray_t *sym, q_valence_t val);
-ray_t *q_symvec_append(ray_t *vec, const char *s, int len);
-extern const char VERB_CHARS[];
 extern const char *ADVERB_NAMES[];
 
 #endif

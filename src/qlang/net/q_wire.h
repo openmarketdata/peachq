@@ -80,7 +80,7 @@ enum { Q_WIRE_ASYNC = 0, Q_WIRE_SYNC = 1, Q_WIRE_RESP = 2 };
  *   201  engine lambda   := 0xC9 attrs(1) obj(params) obj(body)
  *   202  str vector      := 0xCA attrs(1) count(int32) [len(int32) bytes]*
  *   203  quoted sym atom := 0xCB cstr
- *   204  typed-null atom := 0xCC type(int8)   ; BOOL/U8 aux-bit nulls
+ *   204  typed-null atom := 0xCC type(int8)   ; read-only legacy: BOOL/U8 -> plain zero
  *   205  str atom        := 0xCD len(int32) bytes   ; internal -RAY_STR carrier
  * 206..236 reserved for future serde records. */
 #define Q_WIRE_EXT_TAG_FIRST 200
@@ -140,6 +140,11 @@ typedef struct q_wire_wbuf {
  * failure with b->err set. */
 int  q_wire_write_obj(q_wire_wbuf_t* b, ray_t* x);
 void q_wire_wbuf_free(q_wire_wbuf_t* b);
+
+/* A keyword native with no kdb primitive code travels as the root lambda that calls it, spelled by rank: writes
+ * that text (`{til x}`, NUL-terminated) into out and returns its length; 0 for any other value or too small a cap. */
+#define Q_WIRE_KW_LAMBDA_CAP 160
+int  q_wire_keyword_lambda(ray_t* x, char* out, size_t cap);
 
 /* Decode ONE object from buf[0..len).  swap = nonzero when the frame was
  * encoded big-endian.  On success *consumed is the byte count read.

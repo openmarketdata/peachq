@@ -34,7 +34,7 @@ typedef enum {
     QLEX_ADVERB         /* / \ ' /: \: ':                                       */
 } q_lex_class;
 
-/* How the registry builds the value for one (row, valence).  Three kinds only
+/* How the registry builds the value for one (row, valence).  No per-verb kinds
  * (the per-verb QK_* members were retired 2026-07-14 — rows now carry the
  * wrapper FUNCTION POINTER directly, so adding a common verb is one manifest
  * row + one wrapper body + one decl, with no enum member or switch case): */
@@ -46,6 +46,11 @@ typedef enum {
     QK_QSRC,            /* value is the q.q definition `.q.<target>`: skipped at
                          * registry init (q.q loads after), installed by the
                          * post-bootstrap q_registry_bind_qsrc pass             */
+    QK_COMP,            /* value is the composition of the rows named in
+                         * `target` (space-separated, in `'[…]` order), every
+                         * part monadic but the last, which is at this cell's
+                         * valence, built once every row is.  `fn` is the C
+                         * kernel the apply module runs for it                */
     QK_ALIAS            /* SHARE the value already built for row `target` at
                          * THIS valence — a second reserved spelling, never a
                          * second object (`not` is `~:`, `type` is `@:`).  The
@@ -86,9 +91,14 @@ typedef struct {
  * point per overloaded glyph (`?` `!` `@` `.`) dispatching on call rank */
 #define QR_FNV(t, f)  { QK_FN,   (t),  (q_wrap_fn_t)(f),   0, 0 }
 #define QR_QSRC(t)    { QK_QSRC, (t),  NULL,               0, 0 }
-/* COVER = a QSRC cell whose `.q.<t>` value is an extension (`sums` IS `+\`, exposed-infrastructure.md:72) and
- * whose `f` is the unary C kernel that extension's one-argument arm reaches (q_registry_row_kernel) */
-#define QR_COVER(t, f) { QK_QSRC, (t),  (q_wrap_fn_t)(f),   1, 0 }
+/* COVER = a QSRC cell whose `.q.<t>` value is kdb's structure for the keyword (`sums` IS `+\`,
+ * exposed-infrastructure.md:72; `union` IS `'[distinct;,]`) and whose `f` is the C kernel the apply module runs
+ * when that value is applied at this valence (q_registry_row_kernel_at); COMP2 = the same for a glyph, which q.q
+ * cannot name as a `.q` entry (`<>` IS `'[not;=]`) */
+#define QR_COVER(t, f)  { QK_QSRC, (t), (q_wrap_fn_t)(f),   1, 0 }
+#define QR_COVERA(t, f) { QK_QSRC, (t), (q_wrap_fn_t)(f),   1, 1 }
+#define QR_COVER2(t, f) { QK_QSRC, (t), (q_wrap_fn_t)(f),   2, 0 }
+#define QR_COMP2(t, f)  { QK_COMP, (t), (q_wrap_fn_t)(f),   2, 0 }
 #define QR_ALIAS(t)   { QK_ALIAS,(t),  NULL,               0, 0 }
 
 /* One manifest row: a q verb, its lexical class, its monadic/dyadic build recipes
@@ -174,8 +184,18 @@ typedef enum { QI_VALUE, QI_SEED, QI_FILL } q_id_use_t;
 
 /* THE identity-element home: a small name-keyed table in q_ops.c BESIDE the
  * manifest, never a Q_OPS[] column (ruling 2026-08-12).  Returns the OWNED
- * element (rc=1), or NULL when q knows none for that use. */
+ * element (rc=1), or NULL when q knows none for that use or no single value
+ * names it (q_ops_identity_is_null). */
 ray_t* q_ops_identity(const char* spelling, q_id_use_t use);
+
+/* 1 when the identity is the OTHER operand's own null, so `null op y` is y. */
+int q_ops_identity_is_null(const char* spelling);
+
+/* 1 when a dict key-union's missing cells are the other side's typed nulls instead of a fill identity. */
+int q_ops_fill_is_null(const char* spelling);
+
+/* 1 when a dict key-union runs x op y as y op' x, so y's keys come first (x>y is y<x). */
+int q_ops_pair_flips(const char* spelling);
 
 /* The row a QK_ALIAS row is a second spelling of, or NULL when `row` is not an
  * alias.  An alias declares no metadata of its own — every dispatch and
@@ -193,6 +213,7 @@ const q_op_t* q_ops_nested_dyad(const q_op_t* row);
 int q_lex_is_kw_infix(const char* s, int len);
 
 /* The reserved words that are SYNTAX, not functions (control words, qSQL verbs) — `.Q.res`; NULL past the end. */
+enum { Q_SYNTAX_DO, Q_SYNTAX_IF, Q_SYNTAX_WHILE, Q_SYNTAX_SELECT, Q_SYNTAX_EXEC, Q_SYNTAX_UPDATE, Q_SYNTAX_DELETE };
 const char* q_ops_syntax_word(int i);
 
 /* True iff s[0..len) is a RESERVED q verb name (any manifest row).  q reserves

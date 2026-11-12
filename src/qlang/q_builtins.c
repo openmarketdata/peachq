@@ -10,11 +10,13 @@
 #include "qlang/parse/q_parse.h"
 #include "qlang/net/q_http_client.h" /* .Q.c.hg / .Q.c.hp — outbound HTTP client */
 #include "qlang/net/q_http.h"        /* .Q.c.rd — the hardened docroot read */
+#include "qlang/net/q_wire.h"        /* q_wire_keyword_lambda — a keyword with no wire code is 100h */
 #define Q_OPS_ENV_GRANDFATHER /* base-kernel snapshots (capture_base) read the bootstrap catalogue */
 #include "qlang/q_registry_internal.h" /* q_registry_init (shared; brings q_registry.h) */
 #include "qlang/q_env.h"      /* q_env_bind — q's own name surface */
 #include "qlang/ops/q_sys.h"      /* q_system_fn — the q-owned `system` verb */
 #include "qlang/q_console.h"  /* q_console_show — show's display sink */
+#include "qlang/q_ctx.h"      /* q_ctx_ld_fn — .Q.c.ld, the load's grouping */
 #include "qlang/base/q_type.h"     /* q_type_of — the `type` verb's type-number home */
 #include "qlang/io/q_provider.h"     /* provider carriers: 98h, count via provider */
 #include "ops/ops.h"                 /* ray_is_lazy / ray_lazy_materialize */
@@ -41,12 +43,16 @@ static ray_t* on_text(ray_t* x, ray_t* (*f)(const char*, int64_t)) {
     return r;
 }
 
+/* a failure hands the debugger its text and die token: `[2] text` + `(.q.parse)` frames (basics/debug.md §Trap) */
 static ray_t* parse_src(const char* src, int64_t n) {
-    (void)n;
-    ray_t* ast = q_parse(src);
+    ray_t* pos = NULL;
+    ray_t* ast = q_parse_at(src, &pos);
+    if (!ast) ast = q_err(QE_PARSE);
     /* handed out as DATA: empty statements become () (kdb parse ";") */
-    if (ast && !RAY_IS_ERR(ast)) q_ast_fill_empty_stmts(ast);
-    return ast ? ast : q_err(QE_PARSE);
+    if (!RAY_IS_ERR(ast)) q_ast_fill_empty_stmts(ast);
+    else q_dbg_parse_fail(ast, src, n, pos, 1);
+    if (pos) ray_release(pos);
+    return ast;
 }
 
 /* (parse str) — overrides rayfall's lisp parse.  Exported (q_builtins.h) so the `-5!` alias single-homes here. */
@@ -120,7 +126,7 @@ static ray_t* id_fn(ray_t* x) {
 static ray_unary_fn g_base_type  = NULL;
 static ray_unary_fn g_base_count = NULL;
 
-/* q `type` as the kdb short: FUNCTION values report 100h lambda / 101h unary
+/* q `type` as the kdb short: FUNCTION values report 100h lambda (a keyword with no wire code too) / 101h unary
  * primitive (incl. the generic null) / 102h binary+overload primitive / 103h
  * iterator / 104h projection / 106+adv derived; every other value's internal tag ALREADY IS its kdb type
  * number (long 7, sym 11, list 0, table 98, dict 99), atoms stored NEGATIVE.
@@ -145,8 +151,14 @@ static int8_t type_of(ray_t* x) {
     case Q_EVAL_CAR_NONE: case Q_EVAL_CAR_COMP: case Q_EVAL_CAR_VIEW: break;
     }
     if (x->type == RAY_LAMBDA) return 100;
+    char kw[Q_WIRE_KW_LAMBDA_CAP];
+    if (q_wire_keyword_lambda(x, kw, sizeof kw)) return 100;
     if (x->type == RAY_UNARY) return 101;
-    if (x->type == RAY_BINARY || x->type == RAY_VARY) return 102;
+    if (x->type == RAY_VARY) {
+        q_valence_t val = Q_DYADIC;
+        return q_registry_kdb_op_of(x, &val) >= 0 && val == Q_MONADIC ? 101 : 102;
+    }
+    if (x->type == RAY_BINARY) return 102;
     if (q_provider_carrier_is(x))
         return 98;                             /* a bound provider pointer IS a table (its flip is the 99h pair) */
     return x->type;
@@ -326,7 +338,9 @@ void q_builtins_register(void) {
         { ".Q.c.id",   id_fn        }, { ".Q.c.ty",   q_dotq_ty_fn   },
         { ".Q.c.qt",   q_dotq_qt_fn   }, { ".Q.c.qp",   q_dotq_qp_fn   },
         { ".Q.c.s",    q_dotq_s_fn    }, { ".Q.c.atob", q_dotq_atob_fn },
+        { ".Q.c.cells", q_dotq_cells_fn },
         { ".Q.c.hg",   q_dotq_hg_fn   },   /* HTTP GET (ref/dotq.md) */
+        { ".Q.c.ld",   q_ctx_ld_fn    },
         /* No public `.Q` twins — producer seams for q.q's asc/xasc, not keywords. */
         { ".Q.c.sorted", q_attr_stamp_sorted },
         { ".Q.c.parted", q_attr_stamp_parted },
@@ -334,6 +348,7 @@ void q_builtins_register(void) {
     for (size_t i = 0; i < sizeof dotq_c_unary / sizeof *dotq_c_unary; i++)
         bind_unary(dotq_c_unary[i].name, dotq_c_unary[i].fn);
     bind_vary (".Q.c.ops", 1, q_dotq_ops_fn);   /* niladic .Q.ops[] + unary .Q.ops x */
+    bind_vary (".Q.c.S",   2, q_dotq_S_fn);     /* console lines within bounds (wp/permissions .h.jx) */
     bind_vary (".Q.c.w",   1, q_dotq_w_fn);     /* memory stats dict (ref/dotq.md) */
     bind_vary (".Q.c.gc",  1, q_dotq_gc_fn);    /* garbage collect (ref/dotq.md) */
     bind_vary (".Q.c.zblocks", 1, q_dotq_zblocks_fn); /* inflated-blocks witness (internal) */
@@ -342,6 +357,8 @@ void q_builtins_register(void) {
     bind_vary (".Q.c.trp", 3, q_dbg_trp_fn);    /* trap-at + backtrace (ref/dotq.md) */
     bind_vary (".Q.c.trpd", 3, q_dbg_trpd_fn);  /* trap + backtrace, any rank (ref/dotq.md) */
     bind_unary(".Q.c.sbt", q_dbg_sbt_fn);    /* string backtrace (ref/dotq.md) */
+    bind_unary(".Q.c.Ll", q_dbg_ll_fn);      /* the live stack's frame records (SO 76408267) */
+    bind_unary(".Q.c.btx", q_dbg_btx_fn);
     bind_vary (".Q.c.bt",  1, q_dbg_bt_fn);     /* dump backtrace (ref/dotq.md) */
     bind_value(".Q.c.res", q_registry_name_reserved_words());
     /* `.Q.c.rd` — the hardened docroot read h.q's default `.z.ph` serves through.
