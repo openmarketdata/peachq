@@ -47,10 +47,13 @@ int8_t q_cast_designator(ray_t* t, int* is_tok, int* is_identity) {
         return q_type_of_char(c);
     }
     if (t->type == -RAY_SYM) {
-        ray_t* s = ray_sym_str(t->i64);
+        if (t->i64 == 0) { *is_tok = 1; return RAY_SYM; }   /* ` (sym id 0 IS the empty string) = Tok "S" */
+        int8_t r = q_type_of_qname_sym(t->i64);   /* the interned-id fast path */
+        if (r >= 0) return r;
+        ray_t* s = ray_sym_str(t->i64);           /* cache mid-build: string form */
         if (!s) return 0;
         size_t l = ray_str_len(s);
-        int8_t r = l ? q_type_of_qname(ray_str_ptr(s), l) : RAY_SYM;
+        r = l ? q_type_of_qname(ray_str_ptr(s), l) : RAY_SYM;
         if (!l) *is_tok = 1;
         ray_release(s);
         return r;
@@ -76,13 +79,8 @@ static const char* cast_rayname(int8_t tag) {
 }
 
 static ray_t* cast_delegate(int8_t tag, ray_t* x) {
-    const char* nm = cast_rayname(tag);
-    if (!nm) return q_err(QE_TYPE);
-    ray_t* ts = ray_sym(ray_sym_intern(nm, strlen(nm)));
-    if (!ts || RAY_IS_ERR(ts)) return ts;
-    ray_t* r = ray_cast_fn(ts, x);
-    ray_release(ts);
-    return r;
+    if (!cast_rayname(tag)) return q_err(QE_TYPE);
+    return ray_cast_tag(tag, x);   /* the q tags ARE the base tags: no sym round-trip */
 }
 
 /* `$`-to-boolean: "only 0 is false" (owner ruling 2026-07-15; test/q/cast/
@@ -118,10 +116,13 @@ static ray_t* cast_bool(ray_t* x) {
 }
 
 /* char cast (`10h$`/`` `char$``/`"c"$`): reinterpret an integer/byte value as
- * chars, producing a native string (peachq has no char-atom type distinct from
- * a 1-char string).  The boxed-list arm packs a list of ATOMS into ONE string,
- * so "c"$ must beat q_dollar_cast's RAY_LIST distribution (which would build a
- * list of 1-char strings — q_list_collapse refuses to pack them). */
+ * chars, producing q-native char data DIRECTLY (charv vector / -RAY_CHARV
+ * atom) so q_str_charv_out passes it through without a second alloc+copy —
+ * only a stray -RAY_STR input still pays the boundary convert (peachq has no
+ * char-atom type distinct from a 1-char string).  The boxed-list arm packs a
+ * list of ATOMS into ONE string, so "c"$ must beat q_dollar_cast's RAY_LIST
+ * distribution (which would build a list of 1-char strings — q_list_collapse
+ * refuses to pack them). */
 static ray_t* cast_str(ray_t* x) {
     if (x && x->type == -RAY_STR) { ray_retain(x); return x; }   /* identity */
     if (x && (x->type == RAY_CHARV || x->type == -RAY_CHARV)) {  /* charv identity */
@@ -129,19 +130,19 @@ static ray_t* cast_str(ray_t* x) {
     }
     /* a boolean is one byte (cast.md: the bit pattern is unchanged) */
     if (x && (x->type == RAY_BYTE_ONLY || x->type == RAY_BOOL))
-        return ray_str((const char*)ray_data(x), (size_t) q_count(x));
+        return ray_charv((const char*)ray_data(x), q_count(x));
     if (x && (x->type == -RAY_BYTE_ONLY || x->type == -RAY_BOOL)) return ray_char(x->u8);
     if (q_type_is_int_atom(x)) {
         return ray_char((uint8_t)q_type_iatom_val(x));   /* `char$65 -> "A" (atom) */
     }
     if (q_type_is_int_vec(x)) {
         int64_t n = q_count(x);
-        char* buf = (char*)malloc(n > 0 ? (size_t)n : 1);
-        if (!buf) return q_err(QE_WSFULL);
+        ray_t* r = ray_vec_new(RAY_CHARV, n > 0 ? n : 1);
+        if (!r || RAY_IS_ERR(r)) return r ? r : q_err(QE_WSFULL);
+        r->len = n;
+        char* buf = (char*)ray_data(r);
         for (int64_t i = 0; i < n; i++)
             buf[i] = (char)q_type_ivec_get(x, i);
-        ray_t* r = ray_str(buf, (size_t)n);
-        free(buf);
         return r;
     }
     /* float/real -> char rides the byte cast (`char$65e -> "A", cast.md:20
@@ -157,8 +158,10 @@ static ray_t* cast_str(ray_t* x) {
     if (x && x->type == RAY_LIST) {          /* boxed list of int/byte ATOMS -> string */
         int64_t n = q_count(x);
         ray_t** e = (ray_t**)ray_data(x);
-        char* buf = (char*)malloc(n > 0 ? (size_t)n : 1);
-        if (!buf) return q_err(QE_WSFULL);
+        ray_t* r = ray_vec_new(RAY_CHARV, n > 0 ? n : 1);
+        if (!r || RAY_IS_ERR(r)) return r ? r : q_err(QE_WSFULL);
+        r->len = n;
+        char* buf = (char*)ray_data(r);
         for (int64_t i = 0; i < n; i++) {
             ray_t* ei = e[i];
             int64_t v;
@@ -169,11 +172,9 @@ static ray_t* cast_str(ray_t* x) {
             else if (ei && ei->type == -RAY_STR && ray_str_len(ei) == 1)
                 v = (unsigned char)ray_str_ptr(ei)[0];
             else if (ei && ei->type == -RAY_CHARV) v = ei->u8;
-            else { free(buf); return q_err(QE_TYPE); }
+            else { ray_release(r); return q_err(QE_TYPE); }
             buf[i] = (char)v;
         }
-        ray_t* r = ray_str(buf, (size_t)n);
-        free(buf);
         return r;
     }
     return q_err(QE_TYPE);

@@ -417,7 +417,17 @@ clean::
 version:
 	@echo $(RAY_VERSION)
 
-.PHONY: all clean version
+# `$`-conversion regression suite: compatibility golden diff against
+# tests/comp.golden, then per-case timing vs tests/perf.baseline (fail >3x).
+# `make test-record` regenerates both goldens — use after an intentional
+# semantics change or to calibrate the perf floor on a new machine.
+test: $(Q_TARGET)
+	@tests/run_tests.sh
+
+test-record: $(Q_TARGET)
+	@tests/run_tests.sh --record
+
+.PHONY: all clean version test test-record
 
 # The development tree adds tests, gates, benches and the release tooling. It is
 # NOT shipped, so -include silently skips it in the public tree — which is how the

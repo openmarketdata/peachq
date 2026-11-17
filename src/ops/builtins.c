@@ -731,7 +731,7 @@ static void cast_par_fn(void* arg, uint32_t worker_id, int64_t lo, int64_t hi) {
  * through to it produced `month$2019.11.19 2019.12.01 -> 2605.03 2606.03m.
  * Every temporal-target cast arm routes TEMPORAL-source vectors here; the
  * int-family fast path is untouched.  Nulls pass through as typed nulls. */
-static ray_t* cast_vec_temporal_elems(ray_t* type_sym, ray_t* val, int8_t out_type) {
+static ray_t* cast_vec_temporal_elems(ray_t* val, int8_t out_type) {
     int64_t n = ray_len(val);
     ray_t* out = ray_vec_new(out_type, n);
     if (!out || RAY_IS_ERR(out)) return out;
@@ -746,7 +746,7 @@ static ray_t* cast_vec_temporal_elems(ray_t* type_sym, ray_t* val, int8_t out_ty
         int alloc = 0;
         ray_t* e = collection_elem(val, i, &alloc);
         if (!e || RAY_IS_ERR(e)) { ray_release(out); return e; }
-        ray_t* c = ray_cast_fn(type_sym, e);      /* the scalar/atom arm */
+        ray_t* c = ray_cast_tag(out_type, e);     /* the scalar/atom arm */
         if (alloc) ray_release(e);
         if (!c || RAY_IS_ERR(c)) { ray_release(out); return c; }
         store_typed_elem(out, i, c);              /* null atoms set the bit too */
@@ -918,7 +918,7 @@ static void cast_mark_output_sentinels(ray_t* vec, int8_t out_type, int64_t n) {
     }
 }
 
-static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
+static ray_t* cast_vec_numeric(ray_t* val, int8_t out_type) {
     int64_t n2 = val->len;
     ray_t* vec = ray_vec_new(out_type, n2);
     if (RAY_IS_ERR(vec)) return vec;
@@ -981,7 +981,7 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
         int alloc = 0;
         ray_t* elem = collection_elem(val, i, &alloc);
         if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }
-        ray_t* cast = ray_cast_fn(type_sym, elem);
+        ray_t* cast = ray_cast_tag(out_type, elem);
         if (alloc) ray_release(elem);
         if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
         switch (out_type) {
@@ -1007,44 +1007,73 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
     return vec;
 }
 
-ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
-    if (type_sym->type != -RAY_SYM) return ray_error("type", "as: target type must be sym, got %s", ray_type_name(type_sym->type));
+/* Resolve a cast target NAME to its positive type tag (0 = unknown).
+ * cast_match compares case-insensitively, so each spelling is tested once;
+ * the switch on length prunes the ladder to at most a handful of compares. */
+static int8_t cast_tag_of_name(const char* tn, size_t tl) {
+    switch (tl) {
+    case 2:
+        if (cast_match(tn, tl, "U8")) return RAY_BYTE_ONLY;
+        if (cast_match(tn, tl, "B8")) return RAY_BOOL;
+        break;
+    case 3:
+        if (cast_match(tn, tl, "I64")) return RAY_I64;
+        if (cast_match(tn, tl, "I32")) return RAY_I32;
+        if (cast_match(tn, tl, "I16")) return RAY_I16;
+        if (cast_match(tn, tl, "F64")) return RAY_F64;
+        if (cast_match(tn, tl, "SYM")) return RAY_SYM;
+        if (cast_match(tn, tl, "STR")) return RAY_STR;
+        break;
+    case 4:
+        if (cast_match(tn, tl, "BOOL")) return RAY_BOOL;
+        if (cast_match(tn, tl, "DATE")) return RAY_DATE;
+        if (cast_match(tn, tl, "TIME")) return RAY_TIME;
+        if (cast_match(tn, tl, "GUID")) return RAY_GUID;
+        if (cast_match(tn, tl, "DICT")) return RAY_DICT;
+        break;
+    case 5:
+        if (cast_match(tn, tl, "MONTH")) return RAY_MONTH;
+        if (cast_match(tn, tl, "TABLE")) return RAY_TABLE;
+        break;
+    case 6:
+        if (cast_match(tn, tl, "SYMBOL")) return RAY_SYM;
+        if (cast_match(tn, tl, "MINUTE")) return RAY_MINUTE;
+        if (cast_match(tn, tl, "SECOND")) return RAY_SECOND;
+        break;
+    case 8:
+        if (cast_match(tn, tl, "DATETIME")) return RAY_DATETIME;
+        if (cast_match(tn, tl, "TIMESPAN")) return RAY_TIMESPAN;
+        break;
+    case 9:
+        if (cast_match(tn, tl, "TIMESTAMP")) return RAY_TIMESTAMP;
+        break;
+    }
+    return 0;
+}
+
+/* Tag-dispatched cast core (contract: lang/eval.h).  The body of the old
+ * name-laddered ray_cast_fn, keyed on the RESOLVED target tag: per-element
+ * loops (cast_vec_numeric, cast_vec_temporal_elems, the q layer's
+ * cast_delegate) land here directly, paying no sym-table lock or name
+ * compares per element. */
+ray_t* ray_cast_tag(int8_t tag, ray_t* val) {
     /* Null propagation: casting a typed null atom produces a typed null of target type */
     if (ray_is_atom(val) && RAY_ATOM_IS_NULL(val)) {
-        ray_t* s2 = ray_sym_str(type_sym->i64);
-        if (!s2) return ray_error("domain", NULL);
-        const char* tn = ray_str_ptr(s2);
-        size_t tl = ray_str_len(s2);
-        int8_t tt = 0;
-        if (cast_match(tn, tl, "I64") || cast_match(tn, tl, "i64")) tt = -RAY_I64;
-        else if (cast_match(tn, tl, "I32") || cast_match(tn, tl, "i32")) tt = -RAY_I32;
-        else if (cast_match(tn, tl, "I16") || cast_match(tn, tl, "i16")) tt = -RAY_I16;
-        else if (cast_match(tn, tl, "U8") || cast_match(tn, tl, "u8")) tt = -RAY_BYTE_ONLY;
-        else if (cast_match(tn, tl, "F64") || cast_match(tn, tl, "f64")) tt = -RAY_F64;
-        else if (cast_match(tn, tl, "BOOL") || cast_match(tn, tl, "bool") || cast_match(tn, tl, "B8") || cast_match(tn, tl, "b8")) tt = -RAY_BOOL;
-        else if (cast_match(tn, tl, "SYMBOL") || cast_match(tn, tl, "symbol") || cast_match(tn, tl, "sym")) tt = -RAY_SYM;
-        else if (cast_match(tn, tl, "DATE") || cast_match(tn, tl, "date")) tt = -RAY_DATE;
-        else if (cast_match(tn, tl, "MONTH") || cast_match(tn, tl, "month")) tt = -RAY_MONTH;
-        else if (cast_match(tn, tl, "DATETIME") || cast_match(tn, tl, "datetime")) tt = -RAY_DATETIME;
-        else if (cast_match(tn, tl, "MINUTE") || cast_match(tn, tl, "minute")) tt = -RAY_MINUTE;
-        else if (cast_match(tn, tl, "SECOND") || cast_match(tn, tl, "second")) tt = -RAY_SECOND;
-        else if (cast_match(tn, tl, "TIMESPAN") || cast_match(tn, tl, "timespan")) tt = -RAY_TIMESPAN;
-        else if (cast_match(tn, tl, "TIME") || cast_match(tn, tl, "time")) tt = -RAY_TIME;
-        else if (cast_match(tn, tl, "TIMESTAMP") || cast_match(tn, tl, "timestamp")) tt = -RAY_TIMESTAMP;
-        else if (cast_match(tn, tl, "GUID") || cast_match(tn, tl, "guid")) tt = -RAY_GUID;
-        else if (cast_match(tn, tl, "STR") || cast_match(tn, tl, "str")) { ray_release(s2); return ray_str("", 0); }
-        ray_release(s2);
-        if (tt) return ray_typed_null(tt);
-        return ray_error("domain", "as: unknown target type name");
+        switch (tag) {
+        case RAY_I64: case RAY_I32: case RAY_I16: case RAY_BYTE_ONLY:
+        case RAY_F64: case RAY_BOOL: case RAY_SYM: case RAY_DATE:
+        case RAY_MONTH: case RAY_DATETIME: case RAY_MINUTE: case RAY_SECOND:
+        case RAY_TIMESPAN: case RAY_TIME: case RAY_TIMESTAMP: case RAY_GUID:
+            return ray_typed_null((int8_t)-tag);
+        case RAY_STR:
+            return ray_str("", 0);
+        default:
+            return ray_error("domain", "as: unknown target type name");
+        }
     }
-    ray_t* s = ray_sym_str(type_sym->i64);
-    if (!s) return ray_error("domain", NULL);
-    const char* tname = ray_str_ptr(s);
-    size_t tlen = ray_str_len(s);
-
+    switch (tag) {
     /* Cast to I64 / i64 */
-    if (cast_match(tname, tlen, "I64") || cast_match(tname, tlen, "i64")) {
-        ray_release(s);
+    case RAY_I64: {
         if (val->type == -RAY_I64) { ray_retain(val); return val; }
         /* F32 atoms carry their payload in the f64 slot (ray_f32 / atom.c),
          * so every F64 atom arm below covers -RAY_F32 with the same read. */
@@ -1067,12 +1096,11 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         }
         /* Vector/list cast */
         if (ray_is_vec(val) || val->type == RAY_LIST)
-            return cast_vec_numeric(type_sym, val, RAY_I64);
+            return cast_vec_numeric(val, RAY_I64);
         return ray_error("type", "as: cannot cast %s to i64", ray_type_name(val->type));
     }
     /* Cast to I32 / i32 */
-    if (cast_match(tname, tlen, "I32") || cast_match(tname, tlen, "i32")) {
-        ray_release(s);
+    case RAY_I32: {
         if (val->type == -RAY_I32) { ray_retain(val); return val; }
         if (val->type == -RAY_BOOL) return ray_i32(val->b8 ? 1 : 0);
         if (val->type == -RAY_BYTE_ONLY)  return ray_i32((int32_t)val->u8);
@@ -1091,12 +1119,11 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         }
         /* Vector cast */
         if (ray_is_vec(val) || val->type == RAY_LIST)
-            return cast_vec_numeric(type_sym, val, RAY_I32);
+            return cast_vec_numeric(val, RAY_I32);
         return ray_error("type", "as: cannot cast %s to i32", ray_type_name(val->type));
     }
     /* Cast to I16 / i16 */
-    if (cast_match(tname, tlen, "I16") || cast_match(tname, tlen, "i16")) {
-        ray_release(s);
+    case RAY_I16: {
         if (val->type == -RAY_I16) { ray_retain(val); return val; }
         if (val->type == -RAY_BOOL) return ray_i16(val->b8 ? 1 : 0);
         if (val->type == -RAY_BYTE_ONLY)  return ray_i16((int16_t)val->u8);
@@ -1115,12 +1142,11 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         }
         /* Vector cast */
         if (ray_is_vec(val) || val->type == RAY_LIST)
-            return cast_vec_numeric(type_sym, val, RAY_I16);
+            return cast_vec_numeric(val, RAY_I16);
         return ray_error("type", "as: cannot cast %s to i16", ray_type_name(val->type));
     }
     /* Cast to F64 / f64 */
-    if (cast_match(tname, tlen, "F64") || cast_match(tname, tlen, "f64")) {
-        ray_release(s);
+    case RAY_F64: {
         if (val->type == -RAY_F64) { ray_retain(val); return val; }
         if (val->type == -RAY_F32) return make_f64(val->f64);
         if (val->type == -RAY_BOOL) return make_f64(val->b8 ? 1.0 : 0.0);
@@ -1143,12 +1169,11 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         }
         /* Vector cast */
         if (ray_is_vec(val) || val->type == RAY_LIST)
-            return cast_vec_numeric(type_sym, val, RAY_F64);
+            return cast_vec_numeric(val, RAY_F64);
         return ray_error("type", "as: cannot cast %s to f64", ray_type_name(val->type));
     }
     /* Cast to B8/BOOL/b8 */
-    if (cast_match(tname, tlen, "BOOL") || cast_match(tname, tlen, "B8") || cast_match(tname, tlen, "b8")) {
-        ray_release(s);
+    case RAY_BOOL: {
         if (val->type == -RAY_BOOL) { ray_retain(val); return val; }
         if (val->type == -RAY_I64) return make_bool(val->i64 != 0 ? 1 : 0);
         if (val->type == -RAY_I32) return make_bool(val->i32 != 0 ? 1 : 0);
@@ -1162,12 +1187,11 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_STR) return make_bool(ray_str_len(val) > 0 ? 1 : 0);
         /* Vector cast: b8/B8 */
         if (ray_is_vec(val) || val->type == RAY_LIST)
-            return cast_vec_numeric(type_sym, val, RAY_BOOL);
+            return cast_vec_numeric(val, RAY_BOOL);
         return ray_error("type", "as: cannot cast %s to b8", ray_type_name(val->type));
     }
     /* Cast to STR/str */
-    if (cast_match(tname, tlen, "STR") || cast_match(tname, tlen, "str")) {
-        ray_release(s);
+    case RAY_STR: {
         if (val->type == -RAY_STR) { ray_retain(val); return val; }
         if (val->type == -RAY_SYM) {
             ray_t* sym_str = ray_sym_str(val->i64);
@@ -1209,7 +1233,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
                 int alloc = 0;
                 ray_t* elem = collection_elem(val, i, &alloc);
                 if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }
-                ray_t* cast = ray_cast_fn(type_sym, elem);
+                ray_t* cast = ray_cast_tag(RAY_STR, elem);
                 if (alloc) ray_release(elem);
                 if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
                 const char* sp = ray_str_ptr(cast);
@@ -1225,8 +1249,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         return ray_error("type", "as: cannot cast %s to str", ray_type_name(val->type));
     }
     /* Cast to SYMBOL/sym */
-    if (cast_match(tname, tlen, "SYMBOL") || cast_match(tname, tlen, "sym") || cast_match(tname, tlen, "symbol")) {
-        ray_release(s);
+    case RAY_SYM: {
         if (val->type == -RAY_SYM) { ray_retain(val); return val; }
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val);
@@ -1266,7 +1289,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         }
         /* Vector cast: SYMBOL vec from other vecs */
         if (ray_is_vec(val) || val->type == RAY_LIST)
-            return cast_vec_numeric(type_sym, val, RAY_SYM);
+            return cast_vec_numeric(val, RAY_SYM);
         return ray_error("type", "as: cannot cast %s to sym", ray_type_name(val->type));
     }
     /* Cast to DATETIME/datetime (f64 payload = days since 2000.01.01,
@@ -1274,8 +1297,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
      * (ref/cast.md:57) — numbers are day counts; date -> whole days;
      * timestamp -> fractional days.  NaN payloads canonicalize to the null
      * inside ray_datetime; ±inf stays the live 0Wz (2026-07-28). */
-    if (cast_match(tname, tlen, "DATETIME") || cast_match(tname, tlen, "datetime")) {
-        ray_release(s);
+    case RAY_DATETIME: {
         if (val->type == -RAY_DATETIME) { ray_retain(val); return val; }
         if (RAY_ATOM_IS_NULL(val) && ray_is_atom(val))
             return ray_typed_null(-RAY_DATETIME);
@@ -1297,16 +1319,15 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (ray_is_vec(val)) {
             if (val->type == RAY_DATETIME) { ray_retain(val); return val; }
             if (RAY_IS_TEMPORAL32(val->type) || RAY_IS_TEMPORAL64(val->type))
-                return cast_vec_temporal_elems(type_sym, val, RAY_DATETIME);
+                return cast_vec_temporal_elems(val, RAY_DATETIME);
         }
         if (ray_is_vec(val) || val->type == RAY_LIST)
-            return cast_vec_numeric(type_sym, val, RAY_DATETIME);
+            return cast_vec_numeric(val, RAY_DATETIME);
         return ray_error("type", "as: cannot cast %s to datetime", ray_type_name(val->type));
     }
     /* Cast to DATE/date */
     /* Cast to MONTH/month (i32 payload = months since 2000.01) */
-    if (cast_match(tname, tlen, "MONTH") || cast_match(tname, tlen, "month")) {
-        ray_release(s);
+    case RAY_MONTH: {
         if (val->type == -RAY_MONTH) { ray_retain(val); return val; }
         if (RAY_ATOM_IS_NULL(val) && ray_is_atom(val))
             return ray_typed_null(-RAY_MONTH);
@@ -1335,14 +1356,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             if (val->type == RAY_MONTH) { ray_retain(val); return val; }
             if (RAY_IS_TEMPORAL32(val->type) || RAY_IS_TEMPORAL64(val->type) ||
                 RAY_IS_TEMPORALF(val->type))
-                return cast_vec_temporal_elems(type_sym, val, RAY_MONTH);
+                return cast_vec_temporal_elems(val, RAY_MONTH);
         }
         if (ray_is_vec(val) || val->type == RAY_LIST)
-            return cast_vec_numeric(type_sym, val, RAY_MONTH);
+            return cast_vec_numeric(val, RAY_MONTH);
         return ray_error("type", "as: cannot cast %s to month", ray_type_name(val->type));
     }
-    if (cast_match(tname, tlen, "DATE") || cast_match(tname, tlen, "date")) {
-        ray_release(s);
+    case RAY_DATE: {
         if (val->type == -RAY_DATE) { ray_retain(val); return val; }
         if (val->type == -RAY_MONTH) {
             /* First-of-month (kdb `date$2000.02m -> 2000.02.01, ref/xbar.md). */
@@ -1389,18 +1409,17 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
          * stays on the generic fast path. */
         if (ray_is_vec(val)) {
             if (val->type == RAY_DATE) { ray_retain(val); return val; }
-            if (val->type == RAY_TIMESTAMP) return cast_vec_numeric(type_sym, val, RAY_DATE);
+            if (val->type == RAY_TIMESTAMP) return cast_vec_numeric(val, RAY_DATE);
             if (RAY_IS_TEMPORAL32(val->type) || RAY_IS_TEMPORAL64(val->type) ||
                 RAY_IS_TEMPORALF(val->type))
-                return cast_vec_temporal_elems(type_sym, val, RAY_DATE);
+                return cast_vec_temporal_elems(val, RAY_DATE);
         }
         if (ray_is_vec(val) || val->type == RAY_LIST)
-            return cast_vec_numeric(type_sym, val, RAY_DATE);
+            return cast_vec_numeric(val, RAY_DATE);
         return ray_error("type", "as: cannot cast %s to date", ray_type_name(val->type));
     }
     /* Cast to TIME/time */
-    if (cast_match(tname, tlen, "TIME") || cast_match(tname, tlen, "time")) {
-        ray_release(s);
+    case RAY_TIME: {
         if (val->type == -RAY_TIME) { ray_retain(val); return val; }
         if (val->type == -RAY_BOOL) return ray_time((int64_t)val->b8);
         if (val->type == -RAY_BYTE_ONLY)  return ray_time((int64_t)val->u8);
@@ -1463,18 +1482,17 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             if (val->type == RAY_TIME) { ray_retain(val); return val; }
             if (RAY_IS_TEMPORAL32(val->type) || RAY_IS_TEMPORAL64(val->type) ||
                 RAY_IS_TEMPORALF(val->type))
-                return cast_vec_temporal_elems(type_sym, val, RAY_TIME);
+                return cast_vec_temporal_elems(val, RAY_TIME);
         }
         if (ray_is_vec(val) || val->type == RAY_LIST)
-            return cast_vec_numeric(type_sym, val, RAY_TIME);
+            return cast_vec_numeric(val, RAY_TIME);
         return ray_error("type", "as: cannot cast %s to time", ray_type_name(val->type));
     }
     /* Cast to MINUTE/minute (i32 payload = minutes; cast.md:54-61 17h$42 ->
      * 00:42).  Cross-family duration casts convert by ns ratio and FLOOR
      * (cast.md:168-170 "truncates rather than rounds").  timestamp/date
      * sources (time-of-day extraction) are deferred — unpinned by example. */
-    if (cast_match(tname, tlen, "MINUTE") || cast_match(tname, tlen, "minute")) {
-        ray_release(s);
+    case RAY_MINUTE: {
         if (val->type == -RAY_MINUTE) { ray_retain(val); return val; }
         if (RAY_ATOM_IS_NULL(val) && ray_is_atom(val))
             return ray_typed_null(-RAY_MINUTE);
@@ -1507,15 +1525,14 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             if (val->type == RAY_MINUTE) { ray_retain(val); return val; }
             if (RAY_IS_TEMPORAL32(val->type) || RAY_IS_TEMPORAL64(val->type) ||
                 RAY_IS_TEMPORALF(val->type))
-                return cast_vec_temporal_elems(type_sym, val, RAY_MINUTE);
+                return cast_vec_temporal_elems(val, RAY_MINUTE);
         }
         if (ray_is_vec(val) || val->type == RAY_LIST)
-            return cast_vec_numeric(type_sym, val, RAY_MINUTE);
+            return cast_vec_numeric(val, RAY_MINUTE);
         return ray_error("type", "as: cannot cast %s to minute", ray_type_name(val->type));
     }
     /* Cast to SECOND/second (i32 payload = seconds; 18h$42 -> 00:00:42). */
-    if (cast_match(tname, tlen, "SECOND") || cast_match(tname, tlen, "second")) {
-        ray_release(s);
+    case RAY_SECOND: {
         if (val->type == -RAY_SECOND) { ray_retain(val); return val; }
         if (RAY_ATOM_IS_NULL(val) && ray_is_atom(val))
             return ray_typed_null(-RAY_SECOND);
@@ -1544,16 +1561,15 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             if (val->type == RAY_SECOND) { ray_retain(val); return val; }
             if (RAY_IS_TEMPORAL32(val->type) || RAY_IS_TEMPORAL64(val->type) ||
                 RAY_IS_TEMPORALF(val->type))
-                return cast_vec_temporal_elems(type_sym, val, RAY_SECOND);
+                return cast_vec_temporal_elems(val, RAY_SECOND);
         }
         if (ray_is_vec(val) || val->type == RAY_LIST)
-            return cast_vec_numeric(type_sym, val, RAY_SECOND);
+            return cast_vec_numeric(val, RAY_SECOND);
         return ray_error("type", "as: cannot cast %s to second", ray_type_name(val->type));
     }
     /* Cast to TIMESPAN/timespan (i64 payload = ns; 16h$42 ->
      * 0D00:00:00.000000042). */
-    if (cast_match(tname, tlen, "TIMESPAN") || cast_match(tname, tlen, "timespan")) {
-        ray_release(s);
+    case RAY_TIMESPAN: {
         if (val->type == -RAY_TIMESPAN) { ray_retain(val); return val; }
         if (RAY_ATOM_IS_NULL(val) && ray_is_atom(val))
             return ray_typed_null(-RAY_TIMESPAN);
@@ -1573,15 +1589,14 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             if (val->type == RAY_TIMESPAN) { ray_retain(val); return val; }
             if (RAY_IS_TEMPORAL32(val->type) || RAY_IS_TEMPORAL64(val->type) ||
                 RAY_IS_TEMPORALF(val->type))
-                return cast_vec_temporal_elems(type_sym, val, RAY_TIMESPAN);
+                return cast_vec_temporal_elems(val, RAY_TIMESPAN);
         }
         if (ray_is_vec(val) || val->type == RAY_LIST)
-            return cast_vec_numeric(type_sym, val, RAY_TIMESPAN);
+            return cast_vec_numeric(val, RAY_TIMESPAN);
         return ray_error("type", "as: cannot cast %s to timespan", ray_type_name(val->type));
     }
     /* Cast to TIMESTAMP/timestamp */
-    if (cast_match(tname, tlen, "TIMESTAMP") || cast_match(tname, tlen, "timestamp")) {
-        ray_release(s);
+    case RAY_TIMESTAMP: {
         if (val->type == -RAY_TIMESTAMP) { ray_retain(val); return val; }
         if (val->type == -RAY_BOOL) return ray_timestamp((int64_t)val->b8);
         if (val->type == -RAY_BYTE_ONLY)  return ray_timestamp((int64_t)val->u8);
@@ -1679,15 +1694,14 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             if (val->type == RAY_TIMESTAMP) { ray_retain(val); return val; }
             if (RAY_IS_TEMPORAL32(val->type) || RAY_IS_TEMPORAL64(val->type) ||
                 RAY_IS_TEMPORALF(val->type))
-                return cast_vec_temporal_elems(type_sym, val, RAY_TIMESTAMP);
+                return cast_vec_temporal_elems(val, RAY_TIMESTAMP);
         }
         if (ray_is_vec(val) || val->type == RAY_LIST)
-            return cast_vec_numeric(type_sym, val, RAY_TIMESTAMP);
+            return cast_vec_numeric(val, RAY_TIMESTAMP);
         return ray_error("type", "as: cannot cast %s to timestamp", ray_type_name(val->type));
     }
     /* Cast to GUID/guid */
-    if (cast_match(tname, tlen, "GUID") || cast_match(tname, tlen, "guid")) {
-        ray_release(s);
+    case RAY_GUID: {
         if (val->type == -RAY_GUID) { ray_retain(val); return val; }
         if (val->type == -RAY_STR) {
             /* Parse UUID string: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" */
@@ -1718,7 +1732,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             uint8_t* data = (uint8_t*)ray_data(vec);
             ray_t** items = (ray_t**)ray_data(val);
             for (int64_t i = 0; i < n2; i++) {
-                ray_t* cast = ray_cast_fn(type_sym, items[i]);
+                ray_t* cast = ray_cast_tag(RAY_GUID, items[i]);
                 if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
                 memcpy(data + i * 16, ray_guid_bytes(cast), 16);
                 ray_release(cast);
@@ -1730,8 +1744,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         return ray_error("type", "as: cannot cast %s to guid", ray_type_name(val->type));
     }
     /* Cast to U8/u8 */
-    if (cast_match(tname, tlen, "U8") || cast_match(tname, tlen, "u8")) {
-        ray_release(s);
+    case RAY_BYTE_ONLY: {
         if (val->type == -RAY_BYTE_ONLY) { ray_retain(val); return val; }
         if (val->type == -RAY_BOOL) return ray_u8(val->b8 ? 1 : 0);
         if (val->type == -RAY_I16) return ray_u8((uint8_t)val->i16);
@@ -1746,12 +1759,11 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         }
         /* Vector cast */
         if (ray_is_vec(val) || val->type == RAY_LIST)
-            return cast_vec_numeric(type_sym, val, RAY_BYTE_ONLY);
+            return cast_vec_numeric(val, RAY_BYTE_ONLY);
         return ray_error("type", "as: cannot cast %s to u8", ray_type_name(val->type));
     }
     /* Cast to DICT */
-    if (cast_match(tname, tlen, "DICT")) {
-        ray_release(s);
+    case RAY_DICT: {
         if (val->type == RAY_DICT) { ray_retain(val); return val; }
         /* Table -> Dict */
         if (val->type == RAY_TABLE) {
@@ -1773,8 +1785,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         return ray_error("type", "as: cannot cast %s to dict", ray_type_name(val->type));
     }
     /* Cast to TABLE */
-    if (cast_match(tname, tlen, "TABLE")) {
-        ray_release(s);
+    case RAY_TABLE: {
         if (val->type == RAY_TABLE) { ray_retain(val); return val; }
         /* Dict -> Table */
         if (val->type == RAY_DICT) {
@@ -1798,8 +1809,21 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         }
         return ray_error("type", "as: cannot cast %s to table", ray_type_name(val->type));
     }
-    ray_release(s);
+    }
     return ray_error("domain", "as: unknown target type name");
+}
+
+/* The `as` builtin: resolve the target NAME to its tag ONCE, then run the
+ * tag-dispatched core.  Callers that already hold a tag (per-element loops,
+ * the q layer) call ray_cast_tag directly. */
+ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
+    if (type_sym->type != -RAY_SYM) return ray_error("type", "as: target type must be sym, got %s", ray_type_name(type_sym->type));
+    ray_t* s = ray_sym_str(type_sym->i64);
+    if (!s) return ray_error("domain", NULL);
+    int8_t tag = cast_tag_of_name(ray_str_ptr(s), ray_str_len(s));
+    ray_release(s);
+    if (!tag) return ray_error("domain", "as: unknown target type name");
+    return ray_cast_tag(tag, val);
 }
 
 /* (type val) — return the type code of a value */

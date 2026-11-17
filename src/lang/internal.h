@@ -727,6 +727,7 @@ ray_t* ray_resolve_fn(ray_t** args, int64_t n);
 ray_t* ray_timeit_fn(ray_t** args, int64_t n);
 ray_t* ray_exit_fn(ray_t* arg);
 ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val);
+ray_t* ray_cast_tag(int8_t tag, ray_t* val);
 ray_t* ray_type_fn(ray_t* val);
 ray_t* ray_read_file_fn(ray_t* path_obj);
 ray_t* ray_load_file_fn(ray_t* path_obj);

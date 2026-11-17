@@ -11,6 +11,7 @@
 #include "core/types.h"           /* RAY_TYPE_COUNT — the tag-indexed matrix bound */
 #include <string.h>
 #include <math.h>                 /* isinf — the infinity lane */
+#include <stdatomic.h>            /* the qname-id cache's build gate */
 
 int64_t q_type_as_i64(ray_t* x) { return as_i64(x); }
 
@@ -115,6 +116,39 @@ int8_t q_type_of_qname(const char* nm, size_t len) {
         const char* q = q_type_qname((int8_t)t);
         if (q && strlen(q) == len && !memcmp(q, nm, len)) return (int8_t)t;
     }
+    return 0;
+}
+
+/* Sym-id form of q_type_of_qname (contract: q_type.h).  Designator resolution
+ * is on EVERY `$` call's path; going id -> string -> name ladder costs a
+ * sym-table lock plus ~20 strlen/memcmp per call.  Sym ids are stable
+ * (append-only intern table), so the qnames are interned ONCE and a designator
+ * sym resolves by comparing one i64 against this tag-indexed table. */
+static int64_t g_qname_ids[RAY_TYPE_COUNT];
+static _Atomic(int) g_qname_state = 0;   /* 0 = uninit, 1 = building, 2 = ready */
+
+int8_t q_type_of_qname_sym(int64_t id) {
+    int st = atomic_load_explicit(&g_qname_state, memory_order_acquire);
+    if (st != 2) {
+        int expect = 0;
+        if (st != 0 ||
+            !atomic_compare_exchange_strong_explicit(&g_qname_state, &expect, 1,
+                                                     memory_order_acq_rel,
+                                                     memory_order_acquire))
+            return -1;                   /* another thread mid-build: slow path */
+        for (int t = 1; t < RAY_TYPE_COUNT; t++) {
+            const char* q = (t == RAY_ENUM) ? NULL : q_type_qname((int8_t)t);
+            int64_t qid = q ? ray_sym_intern(q, strlen(q)) : -1;
+            if (q && qid < 0) {          /* sym table not up yet: retry later */
+                atomic_store_explicit(&g_qname_state, 0, memory_order_release);
+                return -1;
+            }
+            g_qname_ids[t] = qid;
+        }
+        atomic_store_explicit(&g_qname_state, 2, memory_order_release);
+    }
+    for (int t = 1; t < RAY_TYPE_COUNT; t++)
+        if (g_qname_ids[t] == id) return (int8_t)t;
     return 0;
 }
 

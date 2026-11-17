@@ -46,6 +46,12 @@ int8_t q_type_of_char(char c);
 /* The reverse of q_type_qname: kdb type name (len bytes, unterminated) -> vector tag, 0 for no such name. */
 int8_t q_type_of_qname(const char* nm, size_t len);
 
+/* q_type_of_qname keyed on an INTERNED sym id — the `$` designator hot path
+ * (no sym-table lock, no name ladder; the qnames are interned once).  Returns
+ * the vector tag, 0 for no such name, or -1 when the cache is unavailable
+ * (sym table not up / another thread mid-build): fall back to the string form. */
+int8_t q_type_of_qname_sym(int64_t id);
+
 /* THE q result-type law for a mixed-type pair — what TYPE the result carries
  * (`d&j` -> d), per the "Domain and range" matrix in ref/lesser.md.  Takes
  * VECTOR-form tags; 0 = the pair has no result type (the guid and symbol rows),

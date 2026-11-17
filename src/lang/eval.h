@@ -377,6 +377,11 @@ ray_t* ray_write_file_fn(ray_t* path_obj, ray_t* content);
 
 /* Cast and type */
 ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val);
+/* Tag-dispatched cast core: same semantics as ray_cast_fn with the target
+ * already resolved to a positive type tag (RAY_I64, RAY_DATE, ... plus
+ * RAY_STR/RAY_DICT/RAY_TABLE).  Skips the name lookup entirely — use this
+ * from any loop that casts per element. */
+ray_t* ray_cast_tag(int8_t tag, ray_t* val);
 ray_t* ray_type_fn(ray_t* val);
 
 /* Special forms */
