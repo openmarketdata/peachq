@@ -379,6 +379,11 @@ void ray_index_release_payload(ray_index_t* ix) {
         if (ix->u.codes.next  && !RAY_IS_ERR(ix->u.codes.next))  ray_release(ix->u.codes.next);
         ix->u.codes.dir = ix->u.codes.slots = ix->u.codes.next = NULL;
         break;
+    case RAY_IDX_KHASH:
+        if (ix->u.khash.slots && !RAY_IS_ERR(ix->u.khash.slots))
+            ray_release(ix->u.khash.slots);
+        ix->u.khash.slots = NULL;
+        break;
     case RAY_IDX_ZONE:
     case RAY_IDX_NONE:
         break;
@@ -424,6 +429,10 @@ void ray_index_retain_payload(ray_index_t* ix) {
         if (ix->u.codes.dir   && !RAY_IS_ERR(ix->u.codes.dir))   ray_retain(ix->u.codes.dir);
         if (ix->u.codes.slots && !RAY_IS_ERR(ix->u.codes.slots)) ray_retain(ix->u.codes.slots);
         if (ix->u.codes.next  && !RAY_IS_ERR(ix->u.codes.next))  ray_retain(ix->u.codes.next);
+        break;
+    case RAY_IDX_KHASH:
+        if (ix->u.khash.slots && !RAY_IS_ERR(ix->u.khash.slots))
+            ray_retain(ix->u.khash.slots);
         break;
     case RAY_IDX_ZONE:
     case RAY_IDX_NONE:
@@ -2340,6 +2349,7 @@ static const char* kind_name(ray_idx_kind_t k) {
     case RAY_IDX_PART:       return "part";
     case RAY_IDX_DICT:       return "dict";
     case RAY_IDX_CODES:      return "codes";
+    case RAY_IDX_KHASH:      return "khash";
     default:                 return "none";
     }
 }

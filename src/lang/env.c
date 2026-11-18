@@ -106,6 +106,52 @@ static struct {
     int32_t count;
 } g_env;
 
+/* Direct sym-id -> slot index for global lookups.  Sym ids are dense
+ * (the interner hands them out sequentially), so an array read replaces
+ * the per-reference linear scan of g_env.keys.  -1 = unbound.  The index
+ * is grown inside env_lock on bind; a sym id beyond the grown cap falls
+ * back to the linear scan so a failed realloc can never lose a binding. */
+#define ENV_SLOT_INIT_CAP 1024
+#define ENV_SLOT_MAX_CAP  (1 << 24)
+static int32_t* g_slot_of_sym;
+static int64_t  g_slot_cap;
+
+/* Grow the slot index so it covers sym_id.  Caller holds env_lock (or is
+ * single-threaded at init/destroy).  Returns false when the id is out of
+ * indexing range or the realloc fails — callers then keep the binding
+ * reachable via the linear-scan fallback. */
+static bool env_slot_ensure(int64_t sym_id) {
+    if (sym_id < 0 || sym_id >= ENV_SLOT_MAX_CAP) return false;
+    if (sym_id < g_slot_cap) return true;
+    int64_t cap = g_slot_cap ? g_slot_cap : ENV_SLOT_INIT_CAP;
+    while (cap <= sym_id) cap *= 2;
+    int32_t* n = (int32_t*)ray_sys_alloc(sizeof(int32_t) * (size_t)cap);
+    if (!n) return false;
+    memset(n, 0xFF, sizeof(int32_t) * (size_t)cap);
+    if (g_slot_of_sym) {
+        memcpy(n, g_slot_of_sym, sizeof(int32_t) * (size_t)g_slot_cap);
+        ray_sys_free(g_slot_of_sym);
+    }
+    g_slot_of_sym = n;
+    g_slot_cap = cap;
+    return true;
+}
+
+/* O(1) global probe: indexed hit/miss for covered ids, linear scan for
+ * anything beyond the grown cap (a binding the index could not record). */
+static ray_t* env_lookup_global(int64_t sym_id) {
+    if (sym_id >= 0 && sym_id < g_slot_cap) {
+        int32_t s = g_slot_of_sym[sym_id];
+        if (s >= 0 && s < g_env.count && g_env.keys[s] == sym_id)
+            return g_env.vals[s];
+        return NULL;
+    }
+    for (int32_t i = 0; i < g_env.count; i++) {
+        if (g_env.keys[i] == sym_id) return g_env.vals[i];
+    }
+    return NULL;
+}
+
 /* ---- Local scope stack ---- */
 
 /* The scope stack lives on the per-thread VM (core/runtime.h) — one
@@ -123,6 +169,8 @@ static int64_t g_self_sym = -1;
 
 ray_err_t ray_env_init(void) {
     memset(&g_env, 0, sizeof(g_env));
+    if (g_slot_of_sym) { ray_sys_free(g_slot_of_sym); g_slot_of_sym = NULL; }
+    g_slot_cap = 0;
     __VM->scope_depth = 0;
     return RAY_OK;
 }
@@ -134,6 +182,8 @@ void ray_env_destroy(void) {
         if (g_env.vals[i]) ray_release(g_env.vals[i]);
     }
     memset(&g_env, 0, sizeof(g_env));
+    if (g_slot_of_sym) { ray_sys_free(g_slot_of_sym); g_slot_of_sym = NULL; }
+    g_slot_cap = 0;
     /* The runtime destroy path tears the sym table down too, so the cached
      * `self` id is stale by the time the next runtime spins up. */
     g_self_sym = -1;
@@ -150,10 +200,7 @@ static ray_t* env_lookup_flat(int64_t sym_id) {
         }
         if (f->barrier) break;   /* q strict locality: caller frames hidden */
     }
-    for (int32_t i = 0; i < g_env.count; i++) {
-        if (g_env.keys[i] == sym_id) return g_env.vals[i];
-    }
-    return NULL;
+    return env_lookup_global(sym_id);
 }
 
 ray_t* ray_env_get(int64_t sym_id) {
@@ -301,10 +348,13 @@ static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
         if (g_env.keys[i] == sym_id) {
             if (val == NULL) {
                 if (g_env.vals[i]) ray_release(g_env.vals[i]);
+                if (sym_id < g_slot_cap) g_slot_of_sym[sym_id] = -1;
                 for (int32_t j = i; j + 1 < g_env.count; j++) {
                     g_env.keys[j] = g_env.keys[j + 1];
                     g_env.vals[j] = g_env.vals[j + 1];
                     g_env.user[j] = g_env.user[j + 1];
+                    if (g_env.keys[j] < g_slot_cap)
+                        g_slot_of_sym[g_env.keys[j]] = j;
                 }
                 g_env.count--;
                 env_unlock();
@@ -335,6 +385,7 @@ static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
     ray_retain(val);
     g_env.vals[g_env.count] = val;
     g_env.user[g_env.count] = is_user ? 1 : 0;
+    if (env_slot_ensure(sym_id)) g_slot_of_sym[sym_id] = g_env.count;
     g_env.count++;
     env_unlock();
     return RAY_OK;
@@ -510,10 +561,7 @@ static ray_err_t env_set_dotted(int64_t sym_id, ray_t* val,
 
 /* Scope-specific base lookups used by env_set_dotted. */
 static ray_t* lookup_global(int64_t sym_id) {
-    for (int32_t i = 0; i < g_env.count; i++) {
-        if (g_env.keys[i] == sym_id) return g_env.vals[i];
-    }
-    return NULL;
+    return env_lookup_global(sym_id);
 }
 
 static ray_t* lookup_top_frame(int64_t sym_id) {

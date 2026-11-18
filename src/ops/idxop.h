@@ -78,6 +78,15 @@ typedef enum {
      * allocated on first touch — keeps a sparse id set from paying for the gap.
      * One kind carries all three kdb letters (see the codes arm below); heap-only. */
     RAY_IDX_CODES      = 8,
+    /* Point-probe hash for dict-key columns and boxed-list find domains.
+     * Unlike RAY_IDX_HASH (the canonical numeric index, which probes by a
+     * 64-bit key word), KHASH hashes per parent type — numerics normalize
+     * through f64, SYM by row id, GUID/STR bytes, and LIST rows by a deep
+     * element-wise hash so tuple keys distribute.  Attached LAZILY and IN
+     * PLACE from read paths (ray_index_ensure_khash): a pure function of
+     * the vec's contents, so sharing parents harmlessly share it, and the
+     * usual mutation paths drop it via vec_drop_index_inplace. */
+    RAY_IDX_KHASH      = 9,
 } ray_idx_kind_t;
 
 /* 4096 ids per page: 32 KB of int64 slots, so a dense domain costs one directory
@@ -199,6 +208,13 @@ typedef struct {
             uint8_t  layout;    /* ray_codes_layout_t = slots per id */
             uint8_t  _pad[7];
         } codes;
+        struct {                /* RAY_IDX_KHASH */
+            /* Open addressing over row indices: slots[i] = row, KH_EMPTY(-1)
+             * = free.  Duplicate rows are deduped at build so the stored row
+             * is the FIRST occurrence, matching find's smallest-index law. */
+            ray_t*   slots;     /* RAY_I64 vec, power-of-two entries */
+            int64_t  null_idx;  /* first null row, -1 = none */
+        } khash;
     } u;
 } ray_index_t;
 
@@ -465,6 +481,28 @@ ray_t* ray_index_sort_perm_fresh(ray_t* col);
  * Returns NULL if not eligible (no sort index, stale, null-bearing) or on
  * OOM.  The caller is responsible for releasing the returned vector. */
 ray_t* ray_index_distinct_ids(ray_t* col, int64_t* out_count);
+
+/* ===== KHASH — lazy point-probe index for dict-key columns =====
+ *
+ * ray_index_ensure_khash attaches a KHASH index IN PLACE (no COW) on a
+ * vec of >= KHASH_MIN rows that qualifies (typed key families, SYM on
+ * the runtime domain, GUID, LIST).  It is a pure function of the vec's
+ * contents, so attaching through a borrowed pointer is safe for every
+ * holder of that vec — shared parents share the index, mutations drop
+ * it via vec_drop_index_inplace, and built_for_len catches anything a
+ * write path missed.  Returns the vec unchanged; NULL = not eligible.
+ *
+ * Probe contract (mirrors ray_index_find_row):
+ *   >= 0  → row of the FIRST eq match (smallest row id in the bucket run)
+ *   -1    → provably absent
+ *   -2    → not eligible (no index, stale, wrong kind, null probe)
+ * eq is the caller's cell equality (atom_eq for dict keys, q_match_exact
+ * for find domains, a numeric-f64 lane for typed-vec find). */
+ray_t*  ray_index_ensure_khash(ray_t* vec);
+int64_t ray_index_khash_find(ray_t* vec, ray_t* probe, int (*eq)(ray_t*, ray_t*));
+/* SYM keys vec probed by raw sym id (no atom boxing).  Runtime-domain
+ * columns only — the ensure gate refuses anything else. */
+int64_t ray_index_khash_find_sym(ray_t* keys, int64_t sym_id);
 
 /* ===== Internal helpers (used by retain/release/detach in heap.c
  * and by mutation paths in vec.c) ===== */
