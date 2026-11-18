@@ -2073,6 +2073,24 @@ static int attr_contains(ray_t* vec, ray_t* val) {
     return -1;
 }
 
+/* find_scan's needle law as a cell eq for the lazy keys hash: a same-type
+ * pair compares by atom_eq (the scan's raw compare), a cross-type numeric
+ * pair by the f64 promotion lane, anything else never meets. */
+static int kh_find_eq(ray_t* e, ray_t* p) {
+    if (e->type == p->type) return atom_eq(e, p);
+    if (is_numeric(e) && is_numeric(p)) return as_f64(e) == as_f64(p);
+    return 0;
+}
+
+/* The vec families find_scan's numeric promotion arm covers. */
+static int kh_numeric_family(int8_t t) {
+    switch (t) {
+        case RAY_I64: case RAY_I32: case RAY_I16: case RAY_BOOL:
+        RAY_BYTE_CASES: case RAY_F64: case RAY_F32: return 1;
+        default: return 0;
+    }
+}
+
 /* An atom needle over a typed vector: the index when the domain carries one, else the typed scan.  The row, or -1. */
 static int64_t find_atom(ray_t* vec, ray_t* val) {
     bool has_nulls = (vec->attrs & RAY_ATTR_HAS_NULLS) != 0;
@@ -2094,6 +2112,15 @@ static int64_t find_atom(ray_t* vec, ray_t* val) {
         ray_idx_consults[IDX_SITE_FIND]++;
         int64_t lo, hi;
         if (ray_sorted_span(vec, val, NULL, &lo, &hi)) { ray_idx_hits[IDX_SITE_FIND]++; return hi > lo ? lo : -1; }
+    }
+    /* The lazily-built keys hash (dict-key columns and find domains share
+     * it): same-type or same-family needles only — wider probes keep the
+     * scan's own promotion rules. */
+    if (!val_null && ray_is_atom(val) &&
+        (val->type == -vec->type || (kh_numeric_family(vec->type) && is_numeric(val))) &&
+        ray_index_ensure_khash(vec)) {
+        int64_t row = ray_index_khash_find(vec, val, kh_find_eq);
+        if (row != -2) return row;
     }
     return find_scan(vec, val, 0);
 }

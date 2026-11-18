@@ -24,6 +24,7 @@
 #include "dict.h"
 #include "table.h"
 #include "table/sym.h"
+#include "ops/idxop.h"      /* lazy KHASH point-probe index on the keys vec */
 #include "lang/internal.h"   /* atom_eq for RAY_LIST key compares; atom_is_oob_null for the null-key probe */
 #include <string.h>
 
@@ -105,6 +106,10 @@ int64_t ray_dict_find_sym(ray_t* d, int64_t sym_id) {
     if (!d || RAY_IS_ERR(d) || d->type != RAY_DICT) return -1;
     ray_t* keys = ray_dict_slots(d)[0];
     if (!keys || RAY_IS_ERR(keys) || keys->type != RAY_SYM) return -1;
+    if (ray_index_ensure_khash(keys)) {
+        int64_t r = ray_index_khash_find_sym(keys, sym_id);
+        if (r != -2) return r;
+    }
     void* base = ray_data(keys);
     int64_t n = keys->len;
     uint8_t aw = keys->attrs & RAY_SYM_W_MASK;
@@ -167,6 +172,10 @@ int64_t ray_dict_find_idx(ray_t* d, ray_t* key_atom) {
 
     /* RAY_LIST keys: heterogeneous, compare via atom_eq. */
     if (kt == RAY_LIST) {
+        if (ray_index_ensure_khash(keys)) {
+            int64_t r = ray_index_khash_find(keys, key_atom, atom_eq);
+            if (r != -2) return r;
+        }
         ray_t** ks = (ray_t**)ray_data(keys);
         for (int64_t i = 0; i < n; i++)
             if (atom_eq(ks[i], key_atom)) return i;
@@ -175,6 +184,14 @@ int64_t ray_dict_find_idx(ray_t* d, ray_t* key_atom) {
 
     /* Typed-vector keys: atom type must match. */
     if (key_atom->type != -kt) return -1;
+
+    /* The lazy keys hash answers both probes below: a non-null key walks
+     * its bucket (null rows are simply absent from it), a null key returns
+     * the first null row the same way the scan does. */
+    if (ray_index_ensure_khash(keys)) {
+        int64_t r = ray_index_khash_find(keys, key_atom, atom_eq);
+        if (r != -2) return r;
+    }
 
     /* Null-aware probe: a null key atom matches only null slots; a non-null
      * key atom must match a non-null slot of equal value.  Without this, a

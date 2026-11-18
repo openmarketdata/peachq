@@ -23,6 +23,7 @@
 #include "qlang/ops/q_table.h"  /* q_table_is_cell — the per-column rank rule a record probe is read under */
 #include "lang/eval.h"     /* ray_in_fn, ray_find_fn */
 #include "lang/internal.h" /* atom_eq, ray_sorted_bound */
+#include "ops/idxop.h"     /* lazy KHASH point-probe index on boxed find domains */
 #include "mem/heap.h"      /* RAY_ATTR_HAS_NULLS — ? find miss remap */
 #include <stdint.h>
 #include <stdlib.h>
@@ -387,6 +388,12 @@ static ray_t* keys_at(ray_t* keys, ray_t* i) {
 }
 
 int64_t q_search_find_item(ray_t* x, ray_t* v, int64_t cnt) {
+    /* Null needles keep the scan — find's null law is q_match_exact's, and
+     * a NULL element below simply never matches, so the scan decides. */
+    if (v && !atom_is_oob_null(v) && ray_index_ensure_khash(x)) {
+        int64_t r = ray_index_khash_find(x, v, q_match_exact);
+        if (r != -2) return r < 0 ? cnt : r;
+    }
     ray_t** ex = (ray_t**)ray_data(x);
     for (int64_t i = 0; i < cnt; i++)
         if (ex[i] && v && q_match_exact(ex[i], v)) return i;

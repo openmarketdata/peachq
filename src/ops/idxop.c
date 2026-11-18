@@ -23,6 +23,8 @@
 
 #include "idxop.h"
 #include "ops/internal.h"
+#include "lang/internal.h"   /* atom_eq, is_numeric, as_f64, collection_elem */
+#include "ops/hash.h"
 #include "mem/heap.h"
 #include "mem/cow.h"
 #include "vec/vec.h"
@@ -2456,6 +2458,13 @@ ray_t* ray_index_info(ray_t* v) {
                                 ix->u.codes.slots->len / (RAY_CODES_PAGE * ix->u.codes.layout));
         if (RAY_IS_ERR(r)) goto fail;
         break;
+    case RAY_IDX_KHASH:
+        r = dict_append_sym_i64(&keys, &vals, "capacity",
+                                ix->u.khash.slots ? ix->u.khash.slots->len : 0);
+        if (RAY_IS_ERR(r)) goto fail;
+        r = dict_append_sym_i64(&keys, &vals, "null_idx", ix->u.khash.null_idx);
+        if (RAY_IS_ERR(r)) goto fail;
+        break;
     case RAY_IDX_NONE:
         break;
     }
@@ -2466,6 +2475,213 @@ fail:
     if (!RAY_IS_ERR(keys)) ray_release(keys);
     if (!RAY_IS_ERR(vals)) ray_release(vals);
     return r;
+}
+
+/* --------------------------------------------------------------------------
+ * RAY_IDX_KHASH — lazy point-probe index for dict-key columns and
+ * boxed-list find domains.  See idxop.h for the attach/probe contract.
+ *
+ * Equality is the CALLER's — the hash is only a bucket.  Build stores every
+ * non-null row once (no dedup: two rows equal under one caller's eq may be
+ * distinct under another's, e.g. atom_eq merges 1 and 1.0 while
+ * q_match_exact separates them).  A probe walks its whole bucket run and
+ * returns the smallest eq-matching row — find's smallest-index law under
+ * any equality predicate.
+ * -------------------------------------------------------------------------- */
+
+#define KH_EMPTY    (-1)
+#define KH_MIN_LEN  64
+#define KH_NULL_HASH UINT64_C(0x9e3779b97f4a7c15)
+
+static uint64_t kh_elem_hash(ray_t* e);
+
+/* Row hash per parent type.  Numerics normalize through f64 so a numeric
+ * probe of any width lands in the same bucket as a value-equal row (the
+ * caller's eq then decides whether they actually meet).  Temporal lanes
+ * hash by raw payload — a temporal probe only meets its own type. */
+static uint64_t kh_row_hash(ray_t* v, int64_t i) {
+    const void* d = ray_data(v);
+    switch (v->type) {
+        case RAY_BOOL: RAY_BYTE_CASES:
+            return ray_hash_f64((double)((const uint8_t*)d)[i]);
+        case RAY_I16:
+            return ray_hash_f64((double)((const int16_t*)d)[i]);
+        case RAY_I32:
+            return ray_hash_f64((double)((const int32_t*)d)[i]);
+        case RAY_I64:
+            return ray_hash_f64((double)((const int64_t*)d)[i]);
+        case RAY_F32:
+            return ray_hash_f64((double)((const float*)d)[i]);
+        case RAY_F64: RAY_TEMPORALF_CASES:
+            return ray_hash_f64(((const double*)d)[i]);
+        RAY_TEMPORAL32_CASES:
+            return ray_hash_i64((int64_t)((const int32_t*)d)[i]);
+        RAY_TEMPORAL64_CASES:
+            return ray_hash_i64(((const int64_t*)d)[i]);
+        case RAY_SYM:
+            return ray_hash_i64(ray_read_sym(d, i, RAY_SYM, v->attrs));
+        case RAY_GUID:
+            return ray_hash_bytes((const uint8_t*)d + i * 16, 16);
+        case RAY_LIST:
+            return kh_elem_hash(((ray_t* const*)d)[i]);
+        default:
+            return 0;
+    }
+}
+
+/* Probe-element / LIST-row hash.  atom_is_oob_null for element nulls so
+ * bytelike nulls (which compare by value under atom_eq, not by nullity)
+ * hash as values.  LIST elements recurse so tuple keys distribute; nested
+ * typed vectors fold row hashes so (1 2j) lands deterministically. */
+static uint64_t kh_elem_hash(ray_t* e) {
+    if (!e || atom_is_oob_null(e)) return KH_NULL_HASH;
+    if (is_numeric(e)) return ray_hash_f64(as_f64(e));
+    switch (e->type) {
+        case -RAY_SYM:     return ray_hash_i64(e->i64);
+        case -RAY_GUID:    return ray_hash_bytes(ray_guid_bytes(e), 16);
+        case -RAY_STR:     return ray_hash_bytes(ray_str_ptr(e), ray_str_len(e));
+        case RAY_CHARV:    return ray_hash_bytes(ray_data(e), (size_t)ray_len(e));
+        case -RAY_DATE: case -RAY_TIME: case -RAY_MONTH:
+        case -RAY_MINUTE: case -RAY_SECOND:
+                           return ray_hash_i64((int64_t)e->i32);
+        case -RAY_TIMESTAMP: case -RAY_TIMESPAN:
+                           return ray_hash_i64(e->i64);
+        case -RAY_DATETIME: return ray_hash_f64(e->f64);
+        case RAY_LIST: {
+            ray_t** el = (ray_t**)ray_data(e);
+            int64_t n = ray_len(e);
+            uint64_t h = ray_hash_i64(0x4c495354 + n);
+            for (int64_t i = 0; i < n; i++) h = ray_hash_combine(h, kh_elem_hash(el[i]));
+            return h;
+        }
+        default:
+            if (e->type > 0 && e->type != RAY_STR && ray_is_vec(e)) {
+                int64_t n = ray_len(e);
+                uint64_t h = ray_hash_i64(0x56454300 + e->type + n);
+                for (int64_t i = 0; i < n; i++) h = ray_hash_combine(h, kh_row_hash(e, i));
+                return h;
+            }
+            /* Unknown kind: one bucket per type tag — collisions only cost
+             * eq calls, never a wrong answer. */
+            return ray_hash_i64((int64_t)e->type);
+    }
+}
+
+static int khash_supported_type(ray_t* v) {
+    switch (v->type) {
+        case RAY_BOOL: RAY_BYTE_CASES:
+        case RAY_I16: case RAY_I32: case RAY_I64:
+        case RAY_F32: case RAY_F64: RAY_TEMPORALF_CASES:
+        RAY_TEMPORAL32_CASES: RAY_TEMPORAL64_CASES:
+        case RAY_GUID: case RAY_LIST:
+            return 1;
+        case RAY_SYM:
+            /* Probe ids are runtime-domain; a foreign-domain column would
+             * need id translation the hash can't do. */
+            return ray_sym_vec_domain(v) == ray_sym_runtime_domain();
+        default:
+            return 0;
+    }
+}
+
+static ray_index_t* khash_ix(ray_t* vec) {
+    if (!ray_index_has(vec)) return NULL;
+    ray_index_t* ix = ray_index_payload(vec->index);
+    return (ix->kind == RAY_IDX_KHASH && ix->built_for_len == vec->len) ? ix : NULL;
+}
+
+static ray_t* khash_build(ray_t* v) {
+    int64_t n = v->len;
+    int64_t cap = 16;
+    while (cap < n * 2) cap *= 2;
+    ray_t* slots = ray_vec_new(RAY_I64, cap);
+    if (!slots || RAY_IS_ERR(slots)) return slots;
+    slots->len = cap;
+    int64_t* s = (int64_t*)ray_data(slots);
+    for (int64_t i = 0; i < cap; i++) s[i] = KH_EMPTY;
+    ray_t* idx = ray_index_alloc(RAY_IDX_KHASH, v->type, n);
+    if (!idx || RAY_IS_ERR(idx)) { ray_release(slots); return idx; }
+    ray_index_t* ix = ray_index_payload(idx);
+    ix->u.khash.slots = slots;
+    ix->u.khash.null_idx = KH_EMPTY;
+    uint64_t mask = (uint64_t)cap - 1;
+    bool check_nulls = (v->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    ray_t** el = (v->type == RAY_LIST) ? (ray_t**)ray_data(v) : NULL;
+    for (int64_t i = 0; i < n; i++) {
+        if (el ? (!el[i] || atom_is_oob_null(el[i]))
+               : (check_nulls && ray_vec_is_null(v, i))) {
+            if (ix->u.khash.null_idx == KH_EMPTY) ix->u.khash.null_idx = i;
+            continue;
+        }
+        uint64_t j = kh_row_hash(v, i) & mask;
+        while (s[j] != KH_EMPTY) j = (j + 1) & mask;
+        s[j] = i;
+    }
+    return idx;
+}
+
+ray_t* ray_index_ensure_khash(ray_t* vec) {
+    if (!vec || RAY_IS_ERR(vec)) return NULL;
+    if (!(ray_is_vec(vec) || vec->type == RAY_LIST)) return NULL;
+    if (vec->attrs & RAY_ATTR_SLICE) return NULL;
+    if (vec->len < KH_MIN_LEN) return NULL;
+    if (!khash_supported_type(vec)) return NULL;
+    if (vec->attrs & RAY_ATTR_HAS_INDEX) {
+        /* A live KHASH serves; a foreign or stale index is left alone and
+         * the caller scans — the index owner decides what the vec carries. */
+        return khash_ix(vec) ? vec : NULL;
+    }
+    /* Two readers racing to attach would double-install; take the shared
+     * attach gate try-lock — a loser just scans this probe. */
+    int open = 0;
+    if (!ray_atomic_cas(&g_index_making, &open, 1)) return NULL;
+    if (vec->attrs & RAY_ATTR_HAS_INDEX) {   /* winner's attach already landed */
+        ray_atomic_store(&g_index_making, 0);
+        return khash_ix(vec) ? vec : NULL;
+    }
+    ray_t* idx = khash_build(vec);
+    if (!idx || RAY_IS_ERR(idx)) { if (idx) ray_release(idx); ray_atomic_store(&g_index_making, 0); return NULL; }
+    vec = attach_finalize(vec, idx);
+    ray_atomic_store(&g_index_making, 0);
+    return vec;
+}
+
+int64_t ray_index_khash_find(ray_t* vec, ray_t* probe, int (*eq)(ray_t*, ray_t*)) {
+    ray_index_t* ix = khash_ix(vec);
+    if (!ix || !probe || RAY_IS_ERR(probe) || !eq) return -2;
+    if (atom_is_oob_null(probe))
+        return ix->u.khash.null_idx == KH_EMPTY ? -1 : ix->u.khash.null_idx;
+    const int64_t* s = (const int64_t*)ray_data(ix->u.khash.slots);
+    uint64_t mask = (uint64_t)ix->u.khash.slots->len - 1;
+    ray_t** el = (vec->type == RAY_LIST) ? (ray_t**)ray_data(vec) : NULL;
+    uint64_t j = kh_elem_hash(probe) & mask;
+    int64_t hit = -1;
+    while (s[j] != KH_EMPTY) {
+        int alloc = 0;
+        ray_t* e = el ? el[s[j]] : collection_elem(vec, s[j], &alloc);
+        int m = e && eq(e, probe);
+        if (alloc && e) ray_release(e);
+        if (m && (hit < 0 || s[j] < hit)) hit = s[j];
+        j = (j + 1) & mask;
+    }
+    return hit;
+}
+
+int64_t ray_index_khash_find_sym(ray_t* keys, int64_t sym_id) {
+    ray_index_t* ix = khash_ix(keys);
+    if (!ix || keys->type != RAY_SYM) return -2;
+    const int64_t* s = (const int64_t*)ray_data(ix->u.khash.slots);
+    uint64_t mask = (uint64_t)ix->u.khash.slots->len - 1;
+    const void* d = ray_data(keys);
+    uint64_t j = ray_hash_i64(sym_id) & mask;
+    int64_t hit = -1;
+    while (s[j] != KH_EMPTY) {
+        if (ray_read_sym(d, s[j], RAY_SYM, keys->attrs) == sym_id &&
+            (hit < 0 || s[j] < hit))
+            hit = s[j];
+        j = (j + 1) & mask;
+    }
+    return hit;
 }
 
 /* --------------------------------------------------------------------------
