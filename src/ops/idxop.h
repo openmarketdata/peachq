@@ -251,6 +251,7 @@ void ray_idx_stats_init(void);   /* atexit dump when RAY_IDX_STATS set */
  * On failure, *vp is unchanged and a RAY_ERROR is returned. */
 ray_t* ray_index_attach_zone (ray_t** vp);
 ray_t* ray_index_attach_hash (ray_t** vp);
+ray_t* ray_index_attach_part (ray_t** vp);
 /* The hash for a vector its caller has VERIFIED distinct (`u#`): no first list — every row is its own key, which
  * the UNIQUE marker says — so the build never probes and an append never pushes. */
 ray_t* ray_index_attach_hash_unique(ray_t** vp);

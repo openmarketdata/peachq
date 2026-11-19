@@ -250,6 +250,18 @@ static ray_t* attr_build(ray_t** vp, char letter, bool trusted) {
         return NULL;
     }
     if ((!ray_is_vec(v) && v->type != RAY_ENUM) || ray_attr_numeric_class(v->type) < 0) return q_err(QE_TYPE);
+    /* `p` on an ascending, null-free vector takes the per-run PART directory
+     * (O(runs) storage, one scan) instead of the whole-column hash.  A layout
+     * it cannot hold falls through to the contiguous-check + hash below —
+     * kx's own `p` is ascending-only, so the fallback only serves vectors
+     * whose blocks happen to arrive out of order. */
+    if (letter == 'p') {
+        ray_t* pe = ray_index_attach_part(vp);
+        if (!RAY_IS_ERR(pe)) { ray_index_payload((*vp)->index)->markers |= mark; return NULL; }
+        if (!ray_err_code(pe) || strcmp(ray_err_code(pe), "domain") != 0) return pe;
+        ray_error_free(pe);
+        v = *vp;                                /* part may have cow'd/detached */
+    }
     bool ok = trusted || (letter == 'u' ? (ray_attr_verify_distinct(v) && attr_no_dup_nulls(v))
                         : letter == 'p' ? ray_attr_verify_contiguous(v) : true);
     if (!ok) return q_err(QE_DOMAIN);

@@ -1987,60 +1987,121 @@ ray_t* ray_index_attach_bloom(ray_t** vp) {
  * v1: numeric vectors only (enforced by prepare_attach).
  * -------------------------------------------------------------------------- */
 
-static ray_t* ray_index_attach_part(ray_t** vp) {
+/* One pass over the payload collecting (start, len, key) per value run —
+ * fused non-descending check + run detection, ~1 word read per row.
+ * Typed compare (never raw bytes): it is exact for int-family lanes where a
+ * NaN cannot appear, and for float lanes a NaN anywhere fails (kx rejects
+ * 0Nf/0Ne under `p`; a null-free flag is already the gate).  Return codes:
+ * 0 = parts filled, -1 = not ascending / NaN (domain), -2 = oom. */
+static int part_collect(const ray_t* v, int64_t** st_out, int64_t** ln_out,
+                        uint8_t** kb_out, int64_t* np_out) {
+    const uint8_t* base = (const uint8_t*)ray_data((ray_t*)v);
+    int64_t n = v->len;
+    int es = numeric_elem_size(v->type);
+    if (n <= 0) { *st_out = *ln_out = NULL; *kb_out = NULL; *np_out = 0; return 0; }
+    int64_t cap = 256, k = 0;
+    int64_t* st = (int64_t*)ray_alloc_raw((size_t)cap * sizeof(int64_t));
+    int64_t* ln = (int64_t*)ray_alloc_raw((size_t)cap * sizeof(int64_t));
+    uint8_t* kb = (uint8_t*)ray_alloc_raw((size_t)cap * (size_t)es);
+    if (!st || !ln || !kb) {
+        if (st) ray_free_raw(st);
+        if (ln) ray_free_raw(ln);
+        if (kb) ray_free_raw(kb);
+        return -2;
+    }
+#define PART_RUN(CT, NANCHK) do {                                            \
+        const CT* p = (const CT*)base;                                        \
+        CT prev = p[0];                                                       \
+        int64_t run_start = 0;                                                \
+        for (int64_t i = 1; i < n; i++) {                                     \
+            CT cur = p[i];                                                    \
+            if (cur != prev) {                                                \
+                if (NANCHK || cur < prev) { rc = -1; goto out; }              \
+                if (k == cap) {                                               \
+                    cap *= 2;                                                 \
+                    int64_t* ns = (int64_t*)ray_realloc_raw(st, (size_t)cap * sizeof(int64_t)); \
+                    int64_t* nl = (int64_t*)ray_realloc_raw(ln, (size_t)cap * sizeof(int64_t)); \
+                    uint8_t* nk = (uint8_t*)ray_realloc_raw(kb, (size_t)cap * (size_t)es);        \
+                    if (!ns || !nl || !nk) { if (ns) st = ns; if (nl) ln = nl; if (nk) kb = nk; \
+                        rc = -2; goto out; }                                  \
+                    st = ns; ln = nl; kb = nk;                                \
+                }                                                             \
+                st[k] = run_start; ln[k] = i - run_start;                     \
+                memcpy(kb + (size_t)k * es, base + (size_t)run_start * es, (size_t)es); \
+                k++; run_start = i; prev = cur;                               \
+            }                                                                 \
+        }                                                                     \
+        if (k == cap) {                                                       \
+            cap *= 2;                                                         \
+            int64_t* ns = (int64_t*)ray_realloc_raw(st, (size_t)cap * sizeof(int64_t)); \
+            int64_t* nl = (int64_t*)ray_realloc_raw(ln, (size_t)cap * sizeof(int64_t)); \
+            uint8_t* nk = (uint8_t*)ray_realloc_raw(kb, (size_t)cap * (size_t)es);        \
+            if (!ns || !nl || !nk) { if (ns) st = ns; if (nl) ln = nl; if (nk) kb = nk; \
+                rc = -2; goto out; }                                          \
+            st = ns; ln = nl; kb = nk;                                        \
+        }                                                                     \
+        st[k] = run_start; ln[k] = n - run_start;                             \
+        memcpy(kb + (size_t)k * es, base + (size_t)run_start * es, (size_t)es); \
+        k++;                                                                  \
+    } while (0)
+    int rc = 0;
+    switch (v->type) {
+    case RAY_BOOL: RAY_BYTE_CASES:      PART_RUN(uint8_t, 0); break;
+    case RAY_I16:                       PART_RUN(int16_t, 0); break;
+    case RAY_I32: case RAY_DATE: case RAY_TIME:
+    case RAY_MONTH: case RAY_MINUTE:
+    case RAY_SECOND:                    PART_RUN(int32_t, 0); break;
+    case RAY_I64: case RAY_TIMESTAMP:
+    case RAY_TIMESPAN:                  PART_RUN(int64_t, 0); break;
+    case RAY_F32:                       PART_RUN(float, (cur != cur || prev != prev)); break;
+    case RAY_F64: case RAY_DATETIME:    PART_RUN(double, (cur != cur || prev != prev)); break;
+    default: rc = -1; break;
+    }
+out:
+    if (rc != 0) {
+        ray_free_raw(st); ray_free_raw(ln); ray_free_raw(kb);
+        return rc;
+    }
+#undef PART_RUN
+    *st_out = st; *ln_out = ln; *kb_out = kb; *np_out = k;
+    return 0;
+}
+
+ray_t* ray_index_attach_part(ray_t** vp) {
     ray_t* v = prepare_attach(vp, "part");
     if (RAY_IS_ERR(v)) return v;
     int64_t n = v->len;
 
     /* numeric_key_word buckets a NaN per ROW, so two adjacent nulls would read as
-     * two value-blocks — this index needs the null-free column vec_is_ascending
-     * no longer insists on. */
-    if ((n >= 2 && vec_has_null(v)) || !vec_is_ascending(v))
+     * two value-blocks — this index needs the null-free column; a null-bearing
+     * vector falls to the caller's general path. */
+    if (n >= 2 && vec_has_null(v))
         return ray_error("domain", "parted: column is not laid out as ascending value-blocks");
 
-    const uint8_t* base = (const uint8_t*)ray_data(v);
-    int es = numeric_elem_size(v->type);
+    int64_t* st = NULL; int64_t* ln = NULL; uint8_t* kb = NULL; int64_t nparts = 0;
+    int rc = part_collect(v, &st, &ln, &kb, &nparts);
+    if (rc == -1)
+        return ray_error("domain", "parted: column is not laid out as ascending value-blocks");
+    if (rc != 0) return ray_error("oom", NULL);
 
-    /* Row i starts a new value-block iff it differs from i-1.  The gate above
-     * rejected any null/NaN, so numeric_key_word's NaN branch is unreachable
-     * here and its equality is exact for every accepted type.  Used by both the
-     * count and the fill loop so they cannot drift out of sync. */
-    #define PART_NEW_BLOCK(i) \
-        (numeric_key_word(base, v->type, (i)) != numeric_key_word(base, v->type, (i)-1))
-
-    /* Count runs of equal values. */
-    int64_t nparts = (n > 0) ? 1 : 0;
-    for (int64_t i = 1; i < n; i++)
-        if (PART_NEW_BLOCK(i))
-            nparts++;
-
-    int64_t cap = nparts > 0 ? nparts : 1;
-    ray_t* starts = ray_vec_new(RAY_I64, cap);
-    ray_t* lens   = ray_vec_new(RAY_I64, cap);
-    ray_t* keys   = ray_vec_new(v->type, cap);
+    ray_t* starts = ray_vec_new(RAY_I64, nparts > 0 ? nparts : 1);
+    ray_t* lens   = ray_vec_new(RAY_I64, nparts > 0 ? nparts : 1);
+    ray_t* keys   = ray_vec_new(v->type, nparts > 0 ? nparts : 1);
     if (RAY_IS_ERR(starts) || RAY_IS_ERR(lens) || RAY_IS_ERR(keys)) {
         if (!RAY_IS_ERR(starts)) ray_release(starts);
         if (!RAY_IS_ERR(lens))   ray_release(lens);
         if (!RAY_IS_ERR(keys))   ray_release(keys);
+        ray_free_raw(st); ray_free_raw(ln); ray_free_raw(kb);
         return ray_error("oom", NULL);
     }
     starts->len = lens->len = keys->len = nparts;
-    int64_t* st = (int64_t*)ray_data(starts);
-    int64_t* ln = (int64_t*)ray_data(lens);
-    uint8_t* kb = (uint8_t*)ray_data(keys);
-
-    int64_t p = 0, run_start = 0;
-    for (int64_t i = 1; i <= n; i++) {
-        bool boundary = (i == n) || PART_NEW_BLOCK(i);
-        if (boundary && n > 0) {
-            st[p] = run_start;
-            ln[p] = i - run_start;
-            memcpy(kb + (size_t)p*es, base + (size_t)run_start*es, (size_t)es);
-            p++;
-            run_start = i;
-        }
+    int es = numeric_elem_size(v->type);
+    if (nparts > 0) {
+        memcpy(ray_data(starts), st, (size_t)nparts * sizeof(int64_t));
+        memcpy(ray_data(lens),   ln, (size_t)nparts * sizeof(int64_t));
+        memcpy(ray_data(keys),   kb, (size_t)nparts * (size_t)es);
     }
-    #undef PART_NEW_BLOCK
+    ray_free_raw(st); ray_free_raw(ln); ray_free_raw(kb);
 
     ray_t* idx = ray_index_alloc(RAY_IDX_PART, v->type, n);
     if (!idx || RAY_IS_ERR(idx)) {
