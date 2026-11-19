@@ -656,6 +656,142 @@ static inline int32_t cast_dt_to_timems(double v) {
     return (int32_t)(tod / 1000000LL);
 }
 
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+#include <immintrin.h>
+
+/* round-half-away f64 -> i64 on 8 lanes, identical to (int64_t)round(v)
+ * for |v| < 2^63: the frac is exact (Sterbenz below 2^53; the value is
+ * integral above it), so the ±0.5 compares break ties exactly like
+ * libm round(). */
+static inline __m512i cast_rha_epi64(__m512d v) {
+    __m512i one = _mm512_set1_epi64(1);
+    __m512i t = _mm512_cvttpd_epi64(v);
+    __m512d f = _mm512_sub_pd(v, _mm512_cvtepi64_pd(t));
+    t = _mm512_mask_add_epi64(t, _mm512_cmp_pd_mask(f, _mm512_set1_pd(0.5), _CMP_GE_OQ), t, one);
+    t = _mm512_mask_sub_epi64(t, _mm512_cmp_pd_mask(f, _mm512_set1_pd(-0.5), _CMP_LE_OQ), t, one);
+    return t;
+}
+
+/* trunc(m / 1000000), exact over all i64 m: the f64 quotient errs by
+ * < 1 for |m| <= ~9e18, so one remainder fix-up yields the C result. */
+static inline __m512i div_trunc_1e6(__m512i m) {
+    __m512i one  = _mm512_set1_epi64(1);
+    __m512i mill = _mm512_set1_epi64(1000000);
+    __m512i q = _mm512_cvttpd_epi64(
+        _mm512_mul_pd(_mm512_cvtepi64_pd(m), _mm512_set1_pd(1e-6)));
+    __m512i r = _mm512_sub_epi64(m, _mm512_mullo_epi64(q, mill));
+    q = _mm512_mask_add_epi64(q, _mm512_cmpge_epi64_mask(r, mill), q, one);
+    q = _mm512_mask_sub_epi64(q, _mm512_cmplt_epi64_mask(r, _mm512_setzero_si512()), q, one);
+    return q;
+}
+
+/* dt_ns_i64 x8 — rd must be precomputed AND already in-range on every
+ * lane (caller gates); identical per-lane results. */
+static inline __m512i dt_ns_avx(__m512d val, __m512d rd) {
+    const __m512i one = _mm512_set1_epi64(1);
+    __m512i ns0 = cast_rha_epi64(rd);
+    /* ulp of |val| in ns — the same integer bit-bump as the scalar law */
+    __m512i av = _mm512_and_si512(_mm512_castpd_si512(val),
+                                  _mm512_set1_epi64(0x7fffffffffffffffLL));
+    __m512d ulp = _mm512_mul_pd(
+        _mm512_sub_pd(_mm512_castsi512_pd(_mm512_add_epi64(av, one)),
+                      _mm512_castsi512_pd(av)),
+        _mm512_set1_pd((double)NS_PER_DAY));
+    /* nearest ms tick: trunc((ns0 ± 5e5)/1e6)*1e6 */
+    __m512i  hm  = _mm512_set1_epi64(500000);
+    __mmask8 neg = _mm512_movepi64_mask(ns0);
+    __m512i  m = _mm512_mask_add_epi64(ns0, (__mmask8)~neg, ns0, hm);
+    m = _mm512_mask_sub_epi64(m, neg, m, hm);
+    __m512i tick = _mm512_mullo_epi64(div_trunc_1e6(m), _mm512_set1_epi64(1000000));
+    __m512i diff = _mm512_abs_epi64(_mm512_sub_epi64(ns0, tick));
+    __mmask8 snap = _mm512_cmp_pd_mask(_mm512_cvtepi64_pd(diff), ulp, _CMP_LE_OQ);
+    return _mm512_mask_blend_epi64(snap, ns0, tick);
+}
+
+/* datetime_to_ns over a range: in-range lanes take the 8-wide lane, any
+ * block containing a rare lane (|val*D| >= 9e18, NaN) is redone scalar so
+ * the wide path keeps its exact saturation semantics. */
+static void cast_dt_ns_avx(const double* in, int64_t* out, int64_t lo, int64_t hi) {
+    const __m512d Dv   = _mm512_set1_pd((double)NS_PER_DAY);
+    const __m512d lo_b = _mm512_set1_pd(-9.0e18);
+    const __m512d hi_b = _mm512_set1_pd(9.0e18);
+    int64_t i = lo;
+    for (; i + 8 <= hi; i += 8) {
+        __m512d val = _mm512_loadu_pd(in + i);
+        __m512d rd  = _mm512_mul_pd(val, Dv);
+        __mmask8 ok = _mm512_cmp_pd_mask(rd, lo_b, _CMP_GT_OQ)
+                    & _mm512_cmp_pd_mask(rd, hi_b, _CMP_LT_OQ);
+        if (RAY_UNLIKELY(ok != (__mmask8)0xFF)) {
+            for (int k = 0; k < 8; k++) out[i + k] = datetime_to_ns(in[i + k]);
+            continue;
+        }
+        _mm512_storeu_si512(out + i, dt_ns_avx(val, rd));
+    }
+    for (; i < hi; i++) out[i] = datetime_to_ns(in[i]);
+}
+
+/* floor(ns / NS_PER_DAY) x8 via d = floor(val) + boundary adjust:
+ * in-range ns lies strictly inside ((d-1)D, (d+2)D), so the two integer
+ * compares determine the floor exactly — no i64 divide needed. */
+static void cast_dt_day_avx(const double* in, int32_t* out, int64_t lo, int64_t hi) {
+    const __m512d Dv    = _mm512_set1_pd((double)NS_PER_DAY);
+    const __m512i Di    = _mm512_set1_epi64(NS_PER_DAY);
+    const __m512i one   = _mm512_set1_epi64(1);
+    const __m512d lo_b  = _mm512_set1_pd(-9.0e18);
+    const __m512d hi_b  = _mm512_set1_pd(9.0e18);
+    int64_t i = lo;
+    for (; i + 8 <= hi; i += 8) {
+        __m512d val = _mm512_loadu_pd(in + i);
+        __m512d rd  = _mm512_mul_pd(val, Dv);
+        __mmask8 ok = _mm512_cmp_pd_mask(rd, lo_b, _CMP_GT_OQ)
+                    & _mm512_cmp_pd_mask(rd, hi_b, _CMP_LT_OQ);
+        if (RAY_UNLIKELY(ok != (__mmask8)0xFF)) {
+            for (int k = 0; k < 8; k++) out[i + k] = cast_dt_to_day(in[i + k]);
+            continue;
+        }
+        __m512i ns = dt_ns_avx(val, rd);
+        __m512i d  = _mm512_cvttpd_epi64(
+            _mm512_roundscale_pd(val, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC));
+        __m512i dD = _mm512_mullo_epi64(d, Di);
+        d = _mm512_mask_add_epi64(d, _mm512_cmpge_epi64_mask(ns, _mm512_add_epi64(dD, Di)), d, one);
+        d = _mm512_mask_sub_epi64(d, _mm512_cmplt_epi64_mask(ns, dD), d, one);
+        _mm256_storeu_si256((__m256i*)(out + i), _mm512_cvtepi64_epi32(d));
+    }
+    for (; i < hi; i++) out[i] = cast_dt_to_day(in[i]);
+}
+
+/* (ns mod NS_PER_DAY)/1e6 x8 — tod = ns - day*D is < 2^53, so the f64
+ * quotient + remainder fix-up is exact. */
+static void cast_dt_ms_avx(const double* in, int32_t* out, int64_t lo, int64_t hi) {
+    const __m512d Dv    = _mm512_set1_pd((double)NS_PER_DAY);
+    const __m512i Di    = _mm512_set1_epi64(NS_PER_DAY);
+    const __m512i one   = _mm512_set1_epi64(1);
+    const __m512d lo_b  = _mm512_set1_pd(-9.0e18);
+    const __m512d hi_b  = _mm512_set1_pd(9.0e18);
+    int64_t i = lo;
+    for (; i + 8 <= hi; i += 8) {
+        __m512d val = _mm512_loadu_pd(in + i);
+        __m512d rd  = _mm512_mul_pd(val, Dv);
+        __mmask8 ok = _mm512_cmp_pd_mask(rd, lo_b, _CMP_GT_OQ)
+                    & _mm512_cmp_pd_mask(rd, hi_b, _CMP_LT_OQ);
+        if (RAY_UNLIKELY(ok != (__mmask8)0xFF)) {
+            for (int k = 0; k < 8; k++) out[i + k] = cast_dt_to_timems(in[i + k]);
+            continue;
+        }
+        __m512i ns = dt_ns_avx(val, rd);
+        __m512i d  = _mm512_cvttpd_epi64(
+            _mm512_roundscale_pd(val, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC));
+        __m512i dD = _mm512_mullo_epi64(d, Di);
+        d = _mm512_mask_add_epi64(d, _mm512_cmpge_epi64_mask(ns, _mm512_add_epi64(dD, Di)), d, one);
+        d = _mm512_mask_sub_epi64(d, _mm512_cmplt_epi64_mask(ns, dD), d, one);
+        __m512i tod = _mm512_sub_epi64(ns, _mm512_mullo_epi64(d, Di));
+        _mm256_storeu_si256((__m256i*)(out + i),
+                            _mm512_cvtepi64_epi32(div_trunc_1e6(tod)));
+    }
+    for (; i < hi; i++) out[i] = cast_dt_to_timems(in[i]);
+}
+#endif
+
 /* Vec→vec numeric cast on raw arrays (no per-element atom allocs).
  * Returns the populated `vec` on success, or NULL if the (in_type,
  * out_type) pair is unsupported here — caller falls back to the generic
@@ -792,7 +928,11 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
         return true;
     }
     if (in_type == RAY_DATETIME && out_type == RAY_TIMESTAMP) {
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+        cast_dt_ns_avx((const double*)_src_p, (int64_t*)_dst_p, lo, hi);
+#else
         CAST_LOOP_RANGE(double, int64_t, datetime_to_ns(_v), lo, hi);
+#endif
         return true;
     }
     if (in_type == RAY_DATE && out_type == RAY_DATETIME) {
@@ -801,11 +941,19 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
     }
     if (in_type == RAY_DATETIME && out_type == RAY_DATE) {
         /* Floor to the containing day — the atom arm's datetime split. */
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+        cast_dt_day_avx((const double*)_src_p, (int32_t*)_dst_p, lo, hi);
+#else
         CAST_LOOP_RANGE(double, int32_t, cast_dt_to_day(_v), lo, hi);
+#endif
         return true;
     }
     if (in_type == RAY_DATETIME && out_type == RAY_TIME) {
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+        cast_dt_ms_avx((const double*)_src_p, (int32_t*)_dst_p, lo, hi);
+#else
         CAST_LOOP_RANGE(double, int32_t, cast_dt_to_timems(_v), lo, hi);
+#endif
         return true;
     }
     /* Civil truncation to the month / expansion from it. */
