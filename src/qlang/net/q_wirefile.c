@@ -10,6 +10,7 @@
 #include "qlang/q_env.h"        /* q_env_get — `.z.zd` lives as a plain global */
 #include "qlang/q_prim.h"       /* q_str_text_bytes — nested CHAR rows; q_attr_* — the disk attribute byte */
 #include "qlang/ops/q_index.h"  /* q_index_elem_at — nested row reads */
+#include "ops/idxop.h"          /* RAY_IDX_PART — the p# amend patch's index-sourced trailer */
 #include "qlang/ops/q_table.h"  /* the row law a splay append types its new rows by */
 #include "qlang/eval/q_eval.h"  /* q_eval_apply_concrete, q_eval_apply_value */
 #include "qlang/q_registry.h"   /* the `,` value the append fallback composes on */
@@ -21,6 +22,7 @@
 #include <limits.h>  /* INT_MAX — one read's ceiling */
 #include <sys/stat.h>
 #include <unistd.h>  /* read, close — the domain file's one locked descriptor */
+#include <fcntl.h>   /* open/pwrite — the attr patch's in-place header write */
 
 static int64_t wf_i64(const uint8_t* p) { int64_t v; memcpy(&v, p, 8); return v; }
 static uint32_t wf_u32(const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return v; }
@@ -934,6 +936,52 @@ static ray_t* wf_parted_build(const uint8_t* cells, uint8_t w, int64_t count, ch
         wf_set_i64(t + g.hash + 8 * s, j);
         memcpy(t + g.keys + (size_t)j * w, cells + (size_t)i * w, w);
         wf_set_i64(t + g.starts + 8 * j++, i);
+    }
+    wf_set_i64(t + g.starts + 8 * n, count);
+    t[g.hdr1] = wf_size_class(g.hdr2 - g.hdr1);
+    t[g.hdr1 + 2] = disk;
+    t[g.hdr1 + 3] = 2;
+    wf_set_i64(t + g.hdr1 + 8, n);
+    t[g.hdr2] = wf_size_class(g.len - g.hdr2);
+    t[g.hdr2 + 2] = RAY_I64;
+    wf_set_i64(t + g.hdr2 + 8, n + 1);
+    *out = t;
+    *len = g.len;
+    return NULL;
+}
+
+/* The same trailer bytes as wf_parted_build, sourced from r's RAY_IDX_PART (keys and group starts
+ * already collected by the attribute build — no second scan of the column).  NULL *out wherever the
+ * vec carries no part index: the caller falls back to the scanning build. */
+static ray_t* wf_parted_from_index(ray_t* r, uint8_t w, int64_t count, char layout, uint8_t disk,
+                                   uint8_t** out, size_t* len) {
+    if (!ray_index_has(r)) return NULL;
+    ray_index_t* ix = ray_index_payload(r->index);
+    if (!ix || ix->kind != RAY_IDX_PART) return NULL;
+    int64_t n = ix->u.part.n_parts;
+    ray_t *keys = ix->u.part.keys, *starts = ix->u.part.starts;
+    if (!keys || !starts || (int64_t)keys->len != n || (int64_t)starts->len != n) return NULL;
+    const uint8_t* kd = (const uint8_t*)ray_data(keys);
+    const int64_t* sd = (const int64_t*)ray_data(starts);
+    int64_t lo = 0, hi = 0;
+    for (int64_t j = 0; j < n; j++) {
+        int64_t k = wf_cell(kd, w, j);
+        if (!j || k < lo) lo = k;
+        if (!j || k > hi) hi = k;
+    }
+    wf_parted_geom g = wf_parted_at(layout, w, count, n);
+    if (!wf_parted_proven(disk, g.h, lo, hi)) return NULL;
+    uint8_t* t = (uint8_t*)calloc(1, g.len);
+    if (!t) return q_err(QE_OOM);
+    memset(t + g.hash, 0xff, 8 * g.h);
+    memcpy(t + g.keys, kd, (size_t)n * w);
+    for (int64_t j = 0; j < n; j++) {
+        int64_t k = wf_cell(kd, w, j);
+        size_t s = (size_t)(((uint64_t)k * WF_PART_MUL) >> 11) & (g.h - 1);
+        for (int64_t at; (at = wf_i64(t + g.hash + 8 * s)) >= 0; s = (s + 1) & (g.h - 1))
+            if (wf_cell(t + g.keys, w, at) == k) { free(t); return NULL; }
+        wf_set_i64(t + g.hash + 8 * s, j);
+        wf_set_i64(t + g.starts + 8 * j, sd[j]);
     }
     wf_set_i64(t + g.starts + 8 * n, count);
     t[g.hdr1] = wf_size_class(g.hdr2 - g.hdr1);
@@ -2023,6 +2071,48 @@ ray_t* q_wirefile_splay_append(ray_t* x, ray_t* y, int law, int create, int64_t*
     return bad;
 }
 
+/* An amend whose result carries the SAME element bytes the file already holds — `` `p#x `` and
+ * kin stamp an attribute, never transform — touches only the descriptor byte and a p# column's
+ * index trailer: patch both in place instead of re-serializing and rewriting the elements, as
+ * kdb's own on-disk attribute amend does.  Returns 1 patched, 0 not patchable (the caller then
+ * rewrites the file whole), -1 with *bad an owned error. */
+static int wf_amend_attr_patch(ray_t* path, const q_wf_colhdr* h, ray_t* v, ray_t* r, ray_t** bad) {
+    *bad = NULL;
+    if (!h->mappable || h->zipped || h->nested || h->anymap || h->is_enum) return 0;
+    if (!ray_is_vec(v) || !ray_is_vec(r) || (v->attrs | r->attrs) & RAY_ATTR_SLICE) return 0;
+    if (v->type != r->type || r->type == RAY_SYM || r->type == RAY_ENUM) return 0;
+    int64_t n = q_count(v);
+    if (n < 0 || q_count(r) != n || (h->count >= 0 && h->count != n)) return 0;
+    size_t esz = ray_type_sizes[r->type];
+    if (!esz || (r != v && n && memcmp(ray_data(v), ray_data(r), (size_t)n * esz))) return 0;
+    char letter = q_attr_letter(r);
+    uint8_t* trail = NULL;
+    size_t tlen = 0;
+    if (letter == 'p') {
+        ray_t* e = wf_parted_from_index(r, (uint8_t)esz, n, h->layout == 'D' ? 'D' : 'B',
+                                        (uint8_t)h->tag, &trail, &tlen);
+        if (e) { *bad = e; return -1; }
+        if (!trail)
+            e = wf_parted_build((const uint8_t*)ray_data(r), (uint8_t)esz, n,
+                                h->layout == 'D' ? 'D' : 'B', (uint8_t)h->tag, &trail, &tlen);
+        if (e) { *bad = e; return -1; }
+    }
+    uint8_t hdr[13] = { 0 };
+    hdr[0] = trail ? 3 : letter == 's' ? 1 : 0;   /* the byte wf_col_image translates the letter to */
+    wf_set_i64(hdr + 5, trail ? n : 0);         /* count law: p keeps its count at desc+8, s/none carry 0 */
+    int fd = open(ray_str_ptr(path), O_RDWR);
+    if (fd < 0) { free(trail); return 0; }
+    int64_t eoff = (int64_t)h->payload + n * (int64_t)esz;
+    int ok = pwrite(fd, hdr, 13, (int64_t)h->payload - 16 + 3) == 13;
+    if (ok && tlen) ok = pwrite(fd, trail, tlen, eoff) == (ssize_t)tlen;
+    if (ok) ok = ftruncate(fd, (off_t)(eoff + (int64_t)tlen)) == 0;
+    if (ok) fsync(fd);
+    close(fd);
+    free(trail);
+    if (!ok) { *bad = q_err(QE_IO); return -1; }
+    return 1;
+}
+
 ray_t* q_wirefile_amend(ray_t** args, int64_t n, int dot) {
     ray_t* x = args[0];
     ray_t* i = args[1];
@@ -2041,6 +2131,7 @@ ray_t* q_wirefile_amend(ray_t** args, int64_t n, int dot) {
     ray_t* bad = q_io_guard_write(ray_str_ptr(path), ray_str_len(path));
     ray_t* v = bad ? NULL : wf_read_path(path, 1);
     if (v && RAY_IS_ERR(v)) { bad = v; v = NULL; }
+    if (v) ray_retain(v);                        /* attr patch's compare window; dropped below */
     ray_t* r = NULL;
     if (v && i) {
         r = dot ? q_index_amend_dot(v, i, args[2], y) : q_index_amend_at(v, i, args[2], y);
@@ -2055,10 +2146,16 @@ ray_t* q_wirefile_amend(ray_t** args, int64_t n, int dot) {
         q_wf_colhdr h;
         ray_t* e = q_wirefile_probe(path, &h);
         if (e) { ray_error_free(e); q_err_drop(); }
-        ray_t* dompath = NULL;
-        bad = !e && h.nested && !h.anymap ? wf_write_col(path, r, NULL, &dompath, 0, 0, 0)
-                                          : wf_write_flat_path(path, r, -1, -1, -1);
+        ray_t* perr = NULL;
+        int patched = !e ? wf_amend_attr_patch(path, &h, v, r, &perr) : 0;
+        if (patched < 0) bad = perr;
+        else if (!patched) {
+            ray_t* dompath = NULL;
+            bad = !e && h.nested && !h.anymap ? wf_write_col(path, r, NULL, &dompath, 0, 0, 0)
+                                              : wf_write_flat_path(path, r, -1, -1, -1);
+        }
     }
+    if (v) ray_release(v);
     if (r && !RAY_IS_ERR(r)) ray_release(r);
     ray_release(path);
     if (bad) return bad;

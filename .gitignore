@@ -18,3 +18,4 @@ src/qlang/dotq_gen.h
 .idea/
 .vscode/
 tests/.c4run/
+tab/
