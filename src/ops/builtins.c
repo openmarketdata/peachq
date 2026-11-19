@@ -590,11 +590,13 @@ static bool cast_unit_pair(int8_t in, int8_t out) {
         return out == RAY_SECOND || out == RAY_TIME || out == RAY_TIMESPAN;
     case RAY_TIMESTAMP:
         return out == RAY_DATE || out == RAY_TIME || out == RAY_DATETIME ||
-               out == RAY_MONTH;
+               out == RAY_MONTH || out == RAY_TIMESPAN || out == RAY_MINUTE ||
+               out == RAY_SECOND;
     case RAY_DATE:
         return out == RAY_TIMESTAMP || out == RAY_DATETIME || out == RAY_MONTH;
     case RAY_DATETIME:
-        return out == RAY_TIMESTAMP || out == RAY_DATE || out == RAY_TIME;
+        return out == RAY_TIMESTAMP || out == RAY_DATE || out == RAY_TIME ||
+               out == RAY_TIMESPAN || out == RAY_MINUTE || out == RAY_SECOND;
     case RAY_MONTH:
         return out == RAY_DATE || out == RAY_TIMESTAMP;
     default:
@@ -624,6 +626,14 @@ static bool cast_vec_relabel_compat(int8_t a, int8_t b) {
 static inline int64_t cast_floor_div(int64_t v, int64_t unit) {
     int64_t q = v / unit;
     return (v < 0 && q * unit != v) ? q - 1 : q;
+}
+
+/* A datetime's ns-in-day via the split (fast lane inside; matches
+ * component_leaf's QCOMP_TOD for finite values). */
+static inline int64_t cast_dt_tod_ns(double v) {
+    int64_t d, tod;
+    if (!dt_split_i64(v, &d, &tod)) datetime_to_day_ns(v, &d, &tod);
+    return tod;
 }
 
 /* Civil month of a day count: date_to_ymd's (y, m) as months since 2000.01
@@ -683,6 +693,43 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
         /* Floor-mod ns within day, then ns→ms. */
         CAST_LOOP_RANGE(int64_t, int32_t,
                         (int32_t)(ts_ns_in_day(_v) / 1000000LL), lo, hi);
+        return true;
+    }
+    /* Timestamp/datetime -> duration face: component_leaf's TOD (ns in day)
+     * then the duration narrowing, fused — explicit null/non-finite lanes
+     * mirror component_leaf's ray_vec_is_null/isfinite checks so unflagged
+     * sentinels keep their nulls. */
+    if (in_type == RAY_TIMESTAMP && out_type == RAY_TIMESPAN) {
+        CAST_LOOP_RANGE(int64_t, int64_t, _v == NULL_I64 ? NULL_I64 : ts_ns_in_day(_v), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_TIMESTAMP && out_type == RAY_MINUTE) {
+        CAST_LOOP_RANGE(int64_t, int32_t,
+            _v == NULL_I64 ? NULL_I32 : (int32_t)cast_floor_div(ts_ns_in_day(_v), 60000000000LL), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_TIMESTAMP && out_type == RAY_SECOND) {
+        CAST_LOOP_RANGE(int64_t, int32_t,
+            _v == NULL_I64 ? NULL_I32 : (int32_t)cast_floor_div(ts_ns_in_day(_v), 1000000000LL), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_DATETIME && out_type == RAY_TIMESPAN) {
+        CAST_LOOP_RANGE(double, int64_t, !isfinite(_v) ? NULL_I64 : cast_dt_tod_ns(_v), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_DATETIME && out_type == RAY_MINUTE) {
+        CAST_LOOP_RANGE(double, int32_t,
+            !isfinite(_v) ? NULL_I32 : (int32_t)cast_floor_div(cast_dt_tod_ns(_v), 60000000000LL), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_DATETIME && out_type == RAY_SECOND) {
+        CAST_LOOP_RANGE(double, int32_t,
+            !isfinite(_v) ? NULL_I32 : (int32_t)cast_floor_div(cast_dt_tod_ns(_v), 1000000000LL), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_DATETIME && out_type == RAY_TIME) {
+        CAST_LOOP_RANGE(double, int32_t,
+            !isfinite(_v) ? NULL_I32 : (int32_t)cast_floor_div(cast_dt_tod_ns(_v), 1000000LL), lo, hi);
         return true;
     }
     /* Duration-family narrowing: floor-div by the ns/ms unit ratio (the

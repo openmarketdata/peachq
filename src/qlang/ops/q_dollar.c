@@ -788,6 +788,8 @@ static ray_t* component_leaf(ray_t* x, int64_t comp) {
 /* timespan/minute/second of a timestamp or datetime is its time of day (ref/cast.md:168 "[) notions";
  * kdb-common rand.q:4): the ns of day as a timespan, then the target's own duration narrowing */
 static ray_t* cast_tod(int8_t tag, ray_t* x) {
+    if (x && (x->type == RAY_TIMESTAMP || x->type == RAY_DATETIME))
+        return cast_delegate(tag, x);      /* fused tod+narrow leaf in the vec worker */
     ray_t* ns = component_leaf(x, QCOMP_TOD);
     if (!ns || RAY_IS_ERR(ns)) return ns ? ns : q_err(QE_TYPE);
     ray_t* span = cast_delegate(RAY_TIMESPAN, ns);
