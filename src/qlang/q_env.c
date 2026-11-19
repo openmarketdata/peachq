@@ -55,8 +55,12 @@ static int        g_scoped;
 #define ENV_DEPTH (ENV_PATH->n)
 static int64_t g_pq_seg;                /* `pq`: the one namespace that loads itself */
 static int64_t g_q_seg;                 /* `q`: the namespace whose builtin entries are locked */
+static int64_t g_marker_sym = -1;       /* `` ``: the empty name every resolve compares against */
 
-static int64_t env_marker(void) { return ray_sym_intern_runtime("", 0); }
+static int64_t env_marker(void) {
+    if (g_marker_sym < 0) g_marker_sym = ray_sym_intern_runtime("", 0);
+    return g_marker_sym;
+}
 
 /* q_env_marker_sym — see q_env.h. */
 int64_t q_env_marker_sym(void) { return env_marker(); }
@@ -1218,6 +1222,7 @@ int64_t q_env_scope_ctx(void) { return ENV_CTX; }
 
 ray_err_t q_env_init(void) {
     if (env_root) return RAY_OK;
+    g_marker_sym = ray_sym_intern_runtime("", 0);
     env_root = env_dict(0);
     env_ns   = env_marker_dict();
     env_boot = env_marker_dict();
@@ -1244,6 +1249,7 @@ void q_env_destroy(void) {
     names_free();
     g_ctx = g_scope = g_scoped = 0;
     g_ctx_path.n = g_scope_path.n = 0;
+    g_marker_sym = -1;
 }
 
 /* q `nam set y` (ref/get.md) — assign a global through a symbol handle.  It is

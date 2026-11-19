@@ -507,6 +507,8 @@ int64_t ray_index_khash_find(ray_t* vec, ray_t* probe, int (*eq)(ray_t*, ray_t*)
 /* SYM keys vec probed by raw sym id (no atom boxing).  Runtime-domain
  * columns only — the ensure gate refuses anything else. */
 int64_t ray_index_khash_find_sym(ray_t* keys, int64_t sym_id);
+int64_t ray_index_khash_find_i64(ray_t* keys, int64_t v);
+int64_t ray_index_khash_find_f64(ray_t* keys, double v);
 
 /* ===== Internal helpers (used by retain/release/detach in heap.c
  * and by mutation paths in vec.c) ===== */

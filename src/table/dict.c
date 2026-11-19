@@ -189,7 +189,15 @@ int64_t ray_dict_find_idx(ray_t* d, ray_t* key_atom) {
      * its bucket (null rows are simply absent from it), a null key returns
      * the first null row the same way the scan does. */
     if (ray_index_ensure_khash(keys)) {
-        int64_t r = ray_index_khash_find(keys, key_atom, atom_eq);
+        int64_t r;
+        if (kt == RAY_SYM && !atom_is_oob_null(key_atom))
+            r = ray_index_khash_find_sym(keys, key_atom->i64);
+        else if (kt == RAY_I64 && !atom_is_oob_null(key_atom))
+            r = ray_index_khash_find_i64(keys, key_atom->i64);
+        else if (kt == RAY_F64 && !atom_is_oob_null(key_atom))
+            r = ray_index_khash_find_f64(keys, key_atom->f64);
+        else
+            r = ray_index_khash_find(keys, key_atom, atom_eq);
         if (r != -2) return r;
     }
 

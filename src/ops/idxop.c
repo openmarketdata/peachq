@@ -2745,6 +2745,38 @@ int64_t ray_index_khash_find(ray_t* vec, ray_t* probe, int (*eq)(ray_t*, ray_t*)
     return -1;
 }
 
+/* Typed probes for the I64/F64 key rows — same bucket math as
+ * kh_elem_hash (numerics normalize through f64) but compare the raw row
+ * instead of boxing it through collection_elem + atom_eq.  Null probes
+ * never reach here (caller routes them to null_idx), and a flagged-null
+ * row is absent from the chains, so a plain == is the atom_eq law for
+ * non-null probes. */
+int64_t ray_index_khash_find_i64(ray_t* keys, int64_t v) {
+    ray_index_t* ix = khash_ix(keys);
+    if (!ix || keys->type != RAY_I64) return -2;
+    const int64_t* s = (const int64_t*)ray_data(ix->u.khash.slots);
+    const int64_t* nx = (const int64_t*)ray_data(ix->u.khash.next);
+    uint64_t mask = (uint64_t)ix->u.khash.slots->len - 1;
+    const int64_t* d = (const int64_t*)ray_data(keys);
+    uint64_t j = ray_hash_f64((double)v) & mask;
+    for (int64_t r = s[j]; r != KH_EMPTY; r = nx[r])
+        if (d[r] == v) return r;
+    return -1;
+}
+
+int64_t ray_index_khash_find_f64(ray_t* keys, double v) {
+    ray_index_t* ix = khash_ix(keys);
+    if (!ix || keys->type != RAY_F64) return -2;
+    const int64_t* s = (const int64_t*)ray_data(ix->u.khash.slots);
+    const int64_t* nx = (const int64_t*)ray_data(ix->u.khash.next);
+    uint64_t mask = (uint64_t)ix->u.khash.slots->len - 1;
+    const double* d = (const double*)ray_data(keys);
+    uint64_t j = ray_hash_f64(v) & mask;
+    for (int64_t r = s[j]; r != KH_EMPTY; r = nx[r])
+        if (d[r] == v) return r;
+    return -1;
+}
+
 int64_t ray_index_khash_find_sym(ray_t* keys, int64_t sym_id) {
     ray_index_t* ix = khash_ix(keys);
     if (!ix || keys->type != RAY_SYM) return -2;
