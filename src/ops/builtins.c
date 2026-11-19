@@ -637,12 +637,12 @@ static inline int32_t cast_days_to_month(int64_t days) {
 /* The DATE / TIME faces of the datetime split (atom arms' expressions). */
 static inline int32_t cast_dt_to_day(double v) {
     int64_t d, tod;
-    datetime_to_day_ns(v, &d, &tod);
+    if (!dt_split_i64(v, &d, &tod)) datetime_to_day_ns(v, &d, &tod);
     return (int32_t)d;
 }
 static inline int32_t cast_dt_to_timems(double v) {
     int64_t d, tod;
-    datetime_to_day_ns(v, &d, &tod);
+    if (!dt_split_i64(v, &d, &tod)) datetime_to_day_ns(v, &d, &tod);
     return (int32_t)(tod / 1000000LL);
 }
 
