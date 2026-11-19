@@ -1945,12 +1945,53 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
 /* One typed pass for an atom needle over a typed vector, from `start`: atom_eq's law hoisted out of the loop.  A
  * same-type slot compares raw payloads (a sym cell at its width, the needle re-expressed in a file domain first),
  * a cross-type numeric pair compares as f64, and any other pair meets only at a null.  The row, or -1. */
+/* First null row at/after `start` — the null-needle scan's kernel.  Sentinel
+ * payloads are read directly in a per-type tight loop (the NaN lanes test
+ * exponent-all-ones + nonzero mantissa as raw words, which auto-vectorizes);
+ * boxed/other lanes keep the general reader. */
+static int64_t find_null_row(ray_t* vec, int64_t start) {
+    const void* a = ray_data(vec);
+    int64_t n = vec->len;
+    switch (vec->type) {
+    case RAY_F64: RAY_TEMPORALF_CASES: {
+        const uint64_t* p = (const uint64_t*)a;
+        for (int64_t i = start; i < n; i++)
+            if ((p[i] << 1) > UINT64_C(0xffe0000000000000)) return i;
+        return -1;
+    }
+    case RAY_F32: {
+        const uint32_t* p = (const uint32_t*)a;
+        for (int64_t i = start; i < n; i++)
+            if ((p[i] << 1) > UINT32_C(0xff000000)) return i;
+        return -1;
+    }
+    case RAY_I64: RAY_TEMPORAL64_CASES: {
+        const int64_t* p = (const int64_t*)a;
+        for (int64_t i = start; i < n; i++) if (p[i] == NULL_I64) return i;
+        return -1;
+    }
+    case RAY_I32: RAY_TEMPORAL32_CASES: {
+        const int32_t* p = (const int32_t*)a;
+        for (int64_t i = start; i < n; i++) if (p[i] == NULL_I32) return i;
+        return -1;
+    }
+    case RAY_I16: {
+        const int16_t* p = (const int16_t*)a;
+        for (int64_t i = start; i < n; i++) if (p[i] == NULL_I16) return i;
+        return -1;
+    }
+    default:
+        for (int64_t i = start; i < n; i++) if (ray_vec_is_null(vec, i)) return i;
+        return -1;
+    }
+}
+
 static int64_t find_scan(ray_t* vec, ray_t* val, int64_t start) {
     int64_t n = vec->len;
     bool has_nulls = (vec->attrs & RAY_ATTR_HAS_NULLS) != 0;
     const void* a = ray_data(vec);
     if (atom_is_oob_null(val)) {
-        if (has_nulls) for (int64_t i = start; i < n; i++) if (ray_vec_is_null(vec, i)) return i;
+        if (has_nulls) return find_null_row(vec, start);
         return -1;
     }
     if (!ray_is_atom(val)) return -1;
@@ -2095,6 +2136,12 @@ static int kh_numeric_family(int8_t t) {
 static int64_t find_atom(ray_t* vec, ray_t* val) {
     bool has_nulls = (vec->attrs & RAY_ATTR_HAS_NULLS) != 0;
     bool val_null = atom_is_oob_null(val);
+
+    /* A live KHASH already knows the first null row. */
+    if (val_null && ray_index_has(vec)) {
+        int64_t row = ray_index_khash_find(vec, val, kh_find_eq);
+        if (row != -2) return row;
+    }
 
     /* Float and cross-family needles fall through to the scan, which owns promotion semantics. */
     if (!val_null && ray_is_atom(val) && ray_index_has(vec) && (!has_nulls || ray_index_wake(vec) == RAY_IDX_PART)) {

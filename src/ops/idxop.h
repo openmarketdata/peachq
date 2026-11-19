@@ -209,10 +209,13 @@ typedef struct {
             uint8_t  _pad[7];
         } codes;
         struct {                /* RAY_IDX_KHASH */
-            /* Open addressing over row indices: slots[i] = row, KH_EMPTY(-1)
-             * = free.  Duplicate rows are deduped at build so the stored row
-             * is the FIRST occurrence, matching find's smallest-index law. */
+            /* Separate chaining over row indices: slots[h] = head row of the
+             * hash-h bucket, next[i] = the row after i in its bucket chain
+             * (KH_EMPTY(-1) = none/chain end).  Rows are appended in index
+             * order so every chain is ascending — the first eq-matching row
+             * on a walk IS the smallest index, find's smallest-index law. */
             ray_t*   slots;     /* RAY_I64 vec, power-of-two entries */
+            ray_t*   next;      /* RAY_I64 vec, parent->len entries */
             int64_t  null_idx;  /* first null row, -1 = none */
         } khash;
     } u;

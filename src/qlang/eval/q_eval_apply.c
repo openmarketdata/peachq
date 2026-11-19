@@ -422,6 +422,8 @@ int q_eval_apply_store_elem(ray_t* vec, int64_t i, ray_t* e) {
         switch (vec->type) {
             case RAY_F64: RAY_TEMPORALF_CASES:
                 ((double*)ray_data(vec))[i] = NULL_F64; break;
+            case RAY_F32:
+                ((float*)ray_data(vec))[i] = NULL_F32; break;
             case RAY_I64: RAY_TEMPORAL64_CASES:
                 ((int64_t*)ray_data(vec))[i] = NULL_I64; break;
             case RAY_I32: case RAY_DATE: case RAY_TIME: case RAY_MONTH:
@@ -448,6 +450,10 @@ int q_eval_apply_store_elem(ray_t* vec, int64_t i, ray_t* e) {
             ((double*)ray_data(vec))[i] =
                 (e->type == -RAY_F64 || e->type == -RAY_DATETIME)
                     ? e->f64 : (double)qe_elem_i64(e); return 0;
+        case RAY_F32:
+            ((float*)ray_data(vec))[i] =
+                (e->type == -RAY_F64 || e->type == -RAY_F32 || e->type == -RAY_DATETIME)
+                    ? (float)e->f64 : (float)qe_elem_i64(e); return 0;
         case RAY_I32: case RAY_DATE: case RAY_TIME: case RAY_MONTH:
         case RAY_MINUTE: case RAY_SECOND:
             ((int32_t*)ray_data(vec))[i] = (int32_t)qe_elem_i64(e); return 0;
@@ -466,7 +472,7 @@ int q_eval_apply_store_elem(ray_t* vec, int64_t i, ray_t* e) {
 }
 
 int q_eval_apply_store_elem_ok(int8_t t) {
-    return t == RAY_I64 || t == RAY_F64 || t == RAY_I32 || t == RAY_I16 ||
+    return t == RAY_I64 || t == RAY_F64 || t == RAY_F32 || t == RAY_I32 || t == RAY_I16 ||
            t == RAY_BOOL || t == RAY_BYTE_ONLY || t == RAY_CHARV ||
            RAY_IS_TEMPORAL32(t) || RAY_IS_TEMPORAL64(t) || RAY_IS_TEMPORALF(t);
 }

@@ -384,7 +384,9 @@ void ray_index_release_payload(ray_index_t* ix) {
     case RAY_IDX_KHASH:
         if (ix->u.khash.slots && !RAY_IS_ERR(ix->u.khash.slots))
             ray_release(ix->u.khash.slots);
-        ix->u.khash.slots = NULL;
+        if (ix->u.khash.next && !RAY_IS_ERR(ix->u.khash.next))
+            ray_release(ix->u.khash.next);
+        ix->u.khash.slots = ix->u.khash.next = NULL;
         break;
     case RAY_IDX_ZONE:
     case RAY_IDX_NONE:
@@ -435,6 +437,8 @@ void ray_index_retain_payload(ray_index_t* ix) {
     case RAY_IDX_KHASH:
         if (ix->u.khash.slots && !RAY_IS_ERR(ix->u.khash.slots))
             ray_retain(ix->u.khash.slots);
+        if (ix->u.khash.next && !RAY_IS_ERR(ix->u.khash.next))
+            ray_retain(ix->u.khash.next);
         break;
     case RAY_IDX_ZONE:
     case RAY_IDX_NONE:
@@ -2599,24 +2603,37 @@ static ray_t* khash_build(ray_t* v) {
     slots->len = cap;
     int64_t* s = (int64_t*)ray_data(slots);
     for (int64_t i = 0; i < cap; i++) s[i] = KH_EMPTY;
+    ray_t* nxt = ray_vec_new(RAY_I64, n > 0 ? n : 1);
+    if (!nxt || RAY_IS_ERR(nxt)) { ray_release(slots); return nxt; }
+    nxt->len = n;
+    int64_t* nx = (int64_t*)ray_data(nxt);
+    /* Bucket tails: append keeps every chain in ascending row order, so a
+     * probe's first eq match is the smallest index.  tail[j] is valid only
+     * while s[j] != KH_EMPTY — it is seeded with the head row. */
+    int64_t* tail = (int64_t*)malloc((size_t)cap * sizeof *tail);
+    if (!tail) { ray_release(slots); ray_release(nxt); return ray_error("oom", NULL); }
     ray_t* idx = ray_index_alloc(RAY_IDX_KHASH, v->type, n);
-    if (!idx || RAY_IS_ERR(idx)) { ray_release(slots); return idx; }
+    if (!idx || RAY_IS_ERR(idx)) { ray_release(slots); ray_release(nxt); free(tail); return idx; }
     ray_index_t* ix = ray_index_payload(idx);
     ix->u.khash.slots = slots;
+    ix->u.khash.next = nxt;
     ix->u.khash.null_idx = KH_EMPTY;
     uint64_t mask = (uint64_t)cap - 1;
     bool check_nulls = (v->attrs & RAY_ATTR_HAS_NULLS) != 0;
     ray_t** el = (v->type == RAY_LIST) ? (ray_t**)ray_data(v) : NULL;
     for (int64_t i = 0; i < n; i++) {
+        nx[i] = KH_EMPTY;
         if (el ? (!el[i] || atom_is_oob_null(el[i]))
                : (check_nulls && ray_vec_is_null(v, i))) {
             if (ix->u.khash.null_idx == KH_EMPTY) ix->u.khash.null_idx = i;
             continue;
         }
         uint64_t j = kh_row_hash(v, i) & mask;
-        while (s[j] != KH_EMPTY) j = (j + 1) & mask;
-        s[j] = i;
+        if (s[j] == KH_EMPTY) s[j] = i;
+        else                  nx[tail[j]] = i;
+        tail[j] = i;
     }
+    free(tail);
     return idx;
 }
 
@@ -2652,36 +2669,32 @@ int64_t ray_index_khash_find(ray_t* vec, ray_t* probe, int (*eq)(ray_t*, ray_t*)
     if (atom_is_oob_null(probe))
         return ix->u.khash.null_idx == KH_EMPTY ? -1 : ix->u.khash.null_idx;
     const int64_t* s = (const int64_t*)ray_data(ix->u.khash.slots);
+    const int64_t* nx = (const int64_t*)ray_data(ix->u.khash.next);
     uint64_t mask = (uint64_t)ix->u.khash.slots->len - 1;
     ray_t** el = (vec->type == RAY_LIST) ? (ray_t**)ray_data(vec) : NULL;
     uint64_t j = kh_elem_hash(probe) & mask;
-    int64_t hit = -1;
-    while (s[j] != KH_EMPTY) {
+    /* Chains are ascending — the first eq match IS the smallest row. */
+    for (int64_t r = s[j]; r != KH_EMPTY; r = nx[r]) {
         int alloc = 0;
-        ray_t* e = el ? el[s[j]] : collection_elem(vec, s[j], &alloc);
+        ray_t* e = el ? el[r] : collection_elem(vec, r, &alloc);
         int m = e && eq(e, probe);
         if (alloc && e) ray_release(e);
-        if (m && (hit < 0 || s[j] < hit)) hit = s[j];
-        j = (j + 1) & mask;
+        if (m) return r;
     }
-    return hit;
+    return -1;
 }
 
 int64_t ray_index_khash_find_sym(ray_t* keys, int64_t sym_id) {
     ray_index_t* ix = khash_ix(keys);
     if (!ix || keys->type != RAY_SYM) return -2;
     const int64_t* s = (const int64_t*)ray_data(ix->u.khash.slots);
+    const int64_t* nx = (const int64_t*)ray_data(ix->u.khash.next);
     uint64_t mask = (uint64_t)ix->u.khash.slots->len - 1;
     const void* d = ray_data(keys);
     uint64_t j = ray_hash_i64(sym_id) & mask;
-    int64_t hit = -1;
-    while (s[j] != KH_EMPTY) {
-        if (ray_read_sym(d, s[j], RAY_SYM, keys->attrs) == sym_id &&
-            (hit < 0 || s[j] < hit))
-            hit = s[j];
-        j = (j + 1) & mask;
-    }
-    return hit;
+    for (int64_t r = s[j]; r != KH_EMPTY; r = nx[r])
+        if (ray_read_sym(d, r, RAY_SYM, keys->attrs) == sym_id) return r;
+    return -1;
 }
 
 /* --------------------------------------------------------------------------
