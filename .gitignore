@@ -17,3 +17,4 @@ src/qlang/dotq_gen.h
 *.swp
 .idea/
 .vscode/
+tests/.c4run/

@@ -65,14 +65,17 @@ k=tests/perf.baseline.k;    [ -f "$k" ] || k=/dev/null
 l=tests/perf.baseline.l;    [ -f "$l" ] || l=/dev/null
 if [ "$o$k$l" != "/dev/null/dev/null/dev/null" ]; then
   printf '%-15s %8s %16s %16s %16s\n' "case" "ours" "orig" "kx" "l5"
-  awk 'FNR==1 { f++ }
-       f==1 { if ($2 ~ /^[0-9]+$/) a[$1]=$2; next }
-       f==2 { if ($2 ~ /^[0-9]+$/) b[$1]=$2; next }
-       f==3 { if ($2 ~ /^[0-9]+$/) c[$1]=$2; next }
+  awk -v OF="$o" -v KF="$k" -v LF="$l" '
+       FILENAME==OF { if ($2 ~ /^[0-9]+$/) a[$1]=$2; next }
+       FILENAME==KF { if ($2 ~ /^[0-9]+$/) b[$1]=$2; next }
+       FILENAME==LF { if ($2 ~ /^[0-9]+$/) c[$1]=$2; next }
        $2 ~ /^[0-9]+$/ {
          line = sprintf("%-15s %8d", $1, $2)
-         if ($1 in a)
-           line = line sprintf(" %8d (%4.1fx)", a[$1], ($2 > 0 ? a[$1]/$2 : 0))
+         if ($1 in a) {
+           if ($2 == 0) line = line sprintf(" %8d (n/a)", a[$1])
+           else line = line sprintf(" %8d (%4.1fx)", a[$1], a[$1]/$2)
+         }
+         else line = line sprintf(" %16s", "-")
          if ($1 in b) {
            if (b[$1] == 0) line = line sprintf(" %8d (<1ms)", b[$1])
            else { r = $2/b[$1]; line = line sprintf(" %8d (%.1fx %s)",

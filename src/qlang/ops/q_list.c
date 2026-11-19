@@ -231,6 +231,7 @@ ray_t* q_where_wrap(ray_t* x) {
                       : (x->type == RAY_I32) ? (int64_t)((const int32_t*)ray_data(x))[i]
                       : (int64_t)((const int16_t*)ray_data(x))[i];
             if (c < 0) return q_err(QE_DOMAIN);
+            if (c > INT64_MAX - total) return q_err(QE_LIMIT);
             total += c;
         }
         ray_t* out = ray_vec_new(RAY_I64, total);

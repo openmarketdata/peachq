@@ -60,3 +60,5 @@ run[`dict_tuple;    "t:100000 td[pk3]"];          / boxed-tuple key probe
 run[`kt_row;        "t:100000 kt[pk4]"];          / keyed-table row probe
 run[`dict_findvec;  "t:1000 sd[K]"];              / vector probe: O(keys^2) today
 run[`find_tuple;    "t:10000 TK?pk3"];            / list?tuple find, deep compares
+
+\\

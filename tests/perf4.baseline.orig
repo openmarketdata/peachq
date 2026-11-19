@@ -1,0 +1,9 @@
+part_select 0
+attr_p_vec 2660
+attr_p_file 1417
+find_null_f64 8992
+find_val_f32 7
+peach_writes 2724
+splay_write 2
+csv_write 14422
+file_roundtrip 838

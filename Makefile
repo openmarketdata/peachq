@@ -435,7 +435,16 @@ test: $(Q_TARGET)
 test-record: $(Q_TARGET)
 	@tests/run_tests.sh --record
 
-.PHONY: all clean version test test-record
+# kdb+ 4.1 changelog suite (tests/sample.txt): comp4 replay vs golden,
+# then perf4 cases vs tests/perf4.baseline (fail >3x). Runs inside
+# tests/.c4run so changelog file-writing cases stay in scratch.
+test4: $(Q_TARGET)
+	@tests/run_tests4.sh
+
+test4-record: $(Q_TARGET)
+	@tests/run_tests4.sh --record
+
+.PHONY: all clean version test test-record test4 test4-record
 
 # The development tree adds tests, gates, benches and the release tooling. It is
 # NOT shipped, so -include silently skips it in the public tree — which is how the

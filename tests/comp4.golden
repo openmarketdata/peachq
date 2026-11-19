@@ -1,0 +1,191 @@
+("\"U\"$\"71582789:00\"               / was 00:44 , now 0Nu";0Nu)
+("\"V\"$\"596524:00:00\"              / was -**:28:16 , now 0Nv";0Nv)
+("\"T\"$\"1111111111:00:00.000\"      / was -**:36:52.608 , now 0Nt";0Nt)
+("\"P\"$\"2020.12.01D11111111111111\" / was 2064.10.26D06:34:55.000000000 , n..
+("\"N\"$\"106751D23:47:16.9\"         / was -106751D23:47:16.809551616 , now ..
+("k:([k:1 2]v:3 4); do[10;@[{k+x};`a`b!1 2;::]]; -16!k";2)
+("-1152921504606846977?0Ng   / ended the process";(`err;"oom"))
+("k:([k:1 2]v:3 4); w:1 2 3; do[10;@[{x upsert y}k;w;::]]; -16!w   / refcount..
+("string raze (1;flip `a`b!`tab;2)   / was a crash, now 'splay";(,"1";,"2"))
+("0W 1#til 3";(`err;"oom"))
+("0W 0#til 3     / segfault; now 'limit";(`err;"oom"))
+("1 0W 0#til 3   / segfault; now 'limit";(`err;"oom"))
+("-9!@[-18!2000#0x11;8 9 10 11;:;0xa0860100] / 'badmsg";(`err;"domain"))
+("t:([]time:`s#`time$2147460000 2147460000;v:1 2);";::)
+("(select sum v by time.minute from t)~select sum v by minute:`minute$time fr..
+("get[`:v set (\"abc\";\"def\")]like enlist\"*\"";11b)
+("\"\\n\"$(\"123\";\"456\")";(`err;"nyi"))
+("`:HDB/2026.02.10/test/ set([]time:0 2 4);system\"l HDB\";?[test;();0b;`time..
+("(a;b):get`:foo set (1;0x0000)";::)
+("(`:T/2000.01.01/t/;`:T/2000.01.02/t/) set\\: ([]1000000#1b)";`:T/2000.01.01..
+("l T/";::)
+("select avg x from t";+(,`x)!,,1f)
+("0x01*/0x01020304";24i)
+("1h*/1 2 3 4h";24i)
+("0&/`s#1 2 3";0)
+("{ if[a;1 2]:3 4 }";{ if[a;1 2]:3 4 })
+("do:1";(`err;"assign"))
+("10h$.Q.atob \"aGVsbG8=\"";"hello")
+(".h.hn[\"200 OK\";`jpg;read1`$\":test.jpg\"]";(`err;"io"))
+("{`a`b : x}`c`d";(`err;"match"))
+("{v:(([]a:1 2);enlist(in;`a;(?;(`v;0);(`v;1);0b;(`v;2)));enlist[`a]!enlist `..
+("{v:(([]a:1 2);enlist(in;`a;(?;(`v;0);(`v;1);0b;(`v;2)));enlist[`a]!enlist `..
+("`:ragged/.d set`x`a;";::)
+("`:ragged/x set 1 2;";::)
+("`:ragged/a set 1993#(1 2;3 4);";::)
+("select from `:ragged/;.Q.w[]`mmap";(`err;"corrupt"))
+("@[flip[`a`b!`:foobar]_;0;::]";(`err;"length"))
+("{count .Q.w[]}peach til system\"s\"";())
+("lines:(\"aaa \";\"bbb\");.Q.ld lines;lines";("aaa ";"bbb"))
+("select i from t where i=0,{x=0}[i]";+(,`x)!,0 0)
+(".Q.enxs[$;::;t;`sym]";(`err;"type"))
+(".Q.en[::;t] / user should ensure on-disk file kept in sync with in-memory e..
+("p 5000";::)
+(".z.ac:{[x]hclose .z.w;(2;\"HTTP/1.1 401 Unauthorized\\r\\nConnection: close..
+("`:http://localhost:5000 \"GET / HTTP/1.1\\r\\n\\r\\n\"";(`err;"conn"))
+("a:`g#1#(::);a,:100#`s";(`err;"type"))
+("a:`g#1 1#(::);a,:100#([]`a`b`c)";(`err;"type"))
+("`:a0 set a:\"G\"$(\"8462c71d-bb02-9094-7f17-dcff70120905\";\"746906b1-50b1-..
+(".[`:a0;();`p#]; `:a1 set `p#a; (read1`:a0)~read1`:a1";(`err;"type"))
+("1=count select from ([]get`:a0) where x=first a";1b)
+("l ./db";(`err;"./db"))
+(".Q.MAP[]";())
+("set\\:[;([]a:1 2)]sv'[`],'[;`].Q.par[`:hdb;;`t]@'`long$1e11*1+til 3";`:hdb/..
+("l hdb";::)
+("select from t";+`int`a!(100000000000 100000000000 200000000000 200000000000..
+("select int,a from t";+`int`a!(100000000000 100000000000 200000000000 200000..
+(".Q.id[`b`b1``in!2 3 4 5]~([b:2;b1:3;a:4;in1:5])";1b)
+("`:./db/2001.01.01/t/ set tt:.Q.en[`:./db]([]sym:10?`A`B`C;time:10?.z.T;pric..
+("l ./db";::)
+("`:2001.01.02/t/`:2001.01.03/t/ set\\:tt";`:2001.01.02/t/`:2001.01.03/t/)
+("date";,2001.01.01)
+(".Q.li[2001.01.02];date";(`err;".Q.li"))
+(".Q.li[2001.01.02 2001.01.03];select count i by date from t";(`err;".Q.li"))
+("select date,sym from trade";(`err;"trade"))
+("select by sym,date from trade";(`err;"trade"))
+("select from trade where sym=`AAA,date=.z.D";(`err;"trade"))
+("\"type\"~@[value;\"select from([]1 2)where x within 1\";::]";1b)
+("delete a, from t";+`date`sym`time`price!(2001.01.01 2001.01.01 2001.01.01 2..
+("delete .. a from t";(`err;,"."))
+("a:get`:a 1:((1 2;3 4);(5 6;7 8));  (0#0;0#0)~a 0N / was: ()~a 0N";(`err;"ny..
+("update c:8,d:9 from ([]a) where i=1               / was 'length";+`a`c`d!(8..
+("all 5=count each string last (\"I *S\";2 3 2 5) 0: ` sv 10000#enlist\"12~~~..
+("update a by b from([a:1;b:2]) / 'type";(`err;"type"))
+("read0 each 0 0";("";""))
+("{[1;2]}";(`err;"parse"))
+("{d:([1;2;3]);(a:d):x} / 'type";(`err;"assign"))
+("((,:)a):enlist 1; a~1";(`err;"assign"))
+(".z.ac:{(0;\"\")}";::)
+(".Q.trpd[{x+y};(1;2);{(`err;x)}]";3)
+(".Q.trpd[{x+y};(1;`2);{(`err;x)}]";(`err;"rank"))
+("h({neg[.z.w]\"hclose .z.w\"};::)";(`err;,"h"))
+("{[a:`i;b:`j]$1}";(`err;,"$"))
+("{[a:`i;$1]   1}";(`err;"parse"))
+("((:1+):{x}):1";(`err;"assign"))
+("():1       / 'match";(`err;"match"))
+("exit:1     / 'assign";(`err;"assign"))
+("f:{[x+y]x} / 'nyi";(`err;"parse"))
+("select %[;2]sum a from t";(`err;"type"))
+("h:hopen`:tcps://localhost:5001";(`err;"timeout. localhost:5001: no reply in..
+("h\".z.e`CERT\"";(`err;,"h"))
+("\"type\"~@[{(a:`a`B):x};1;::]";(`err;"assign"))
+("d:([k1:v1;k2:v2;..]);    k1:1;d:([k1;k2:2]);   d:([1;2]);d~([x:1;x1:2])";(`..
+("([k1:;k2:])[1;\"a\"] / ~ ([k1:1;k2:\"a\"]); compare: (;)[1;\"a\"] ~ (1;\"a\..
+("f:{[p:`f;s:`j]p*s};         msg:{(sym:`s;ex:`c;price:`f):x}";::)
+("addprice:{[(s;e;p):msg;x:`f](s;e;p+x)};";(`err;"parse"))
+("addprice[(`A;\"b\";10.5);2.5] / w/o checks can do: addprice:{(;;:y+):x}";(`..
+("a:get`:a set `sym?5120#`a; b:get`:a;c:get`:a;b:(); `p#c";("len";5120;"type"..
+("a:0;{a:1;exec value\"2*a\"from([]``)}[]";0)
+("{select from t where {1b}[x]}peach 1 2";(`err;"type"))
+("var(1;2i)";0.25)
+("var(1 2;3 4i)";1 1f)
+("n:10000;{(\"js\";1#\",\")0:x}peach 2#`:test.csv 0:\",\"0:([]a:n#1;b:n?`2)";..
+("get `:lsym set a:`$2097153#\"a\"";`aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..
+("([k:1 2 3]s:110b;t:1 2 3)^([k:1 2 3]t:3 4 5)";(+(,`k)!,1 2 3)!+`s`t!(110b;3..
+("([k:1 2 3]s:110b;t:1 2 3)^reverse ([k:1 2 3]t:3 4 5)";(+(,`k)!,1 2 3)!+`s`t..
+(,"a";,"b")
+("0N!\" \"vs\"x\"$\"a b\";";::)
+(,0x61;,0x62)
+("0N!0x20 vs\"x\"$\"a b\";";::)
+("(::)peach([]1 2;3 4)";+`x`x1!(1 2;3 4))
+("csv 0:([](\"foo\\nbar\";\"baz\"))";(,"x";"\"foo\nbar\"";"baz"))
+("`t1 lj t2";(`err;"t2"))
+("`t1 ljf t2";(`err;"t2"))
+("`t1 pj t2";(`err;"t2"))
+("aj[`sym`time;`t1;t2]";(`err;"t2"))
+("ajf[`sym`time;`t1;t2]";(`err;"t2"))
+("aj0[`sym`time;`t1;t2]";(`err;"t2"))
+("ajf0[`sym`time;`t1;t2]";(`err;"t2"))
+("wj[w;`sym`time;`t1;(t2;(max;`bid);(min;`ask))]";(`err;"t2"))
+("wj1[w;`sym`time;`t1;(t2;(max;`bid);(min;`ask))]";(`err;"t2"))
+("select link.x by sym from trade";(`err;"trade"))
+("(`:a;12;1;0) set 1 2; p:-21!`:a;.[`:a;();`p#];(2_p)~2_-21!`:a";0b)
+("(`:file;17;2;9)1:100#0x0";`:file)
+("all{x~get`:parse.bin set x}each(1+;'[sum;avg])";1b)
+("key`:db/2023.02.01";())
+(".Q.lo[`db;0;0]";(`err;".Q.lo"))
+("trade";(`err;"trade"))
+("v:(3?4000)#'\"a\";n:`$\":a\",/:string til system\"s\";{x set 100000?v}peach..
+("select sum x by y from ([](1 2;3 4);y:-1 1h)";(+(,`y)!,`s#-1 1h)!+(,`x)!,(1..
+(".Q.id`$\"_\"";`a_)
+("cols .Q.id(`$(\"3aa\";\"_aa\";\"_aa\"))xcol([]1 2;3 4;5 6)";`a3aa`a_aa`a_aa1)
+("p 80/85";(`err;"io"))
+("p";5000i)
+("p myhost:2000/2010";(`err;"io"))
+("p -2000/2010";(`err;"domain"))
+(".Q.ld read0`:funcs.q";(`err;"io"))
+(".Q.gc 0 / least aggressive";0)
+(".Q.gc[] / most aggressive (continue to use this in the general case; curren..
+(".z.zd:17 5 1;x~get `:ziptest set x:asc 10000000?1000";(`err;"nyi"))
+("`:oldenum set `:sym?`a`b`c / in v3.5 or earlier";`:oldenum)
+("1 0 3 1~([]1 2 3;get`:oldenum)?([]2 1 0 2;`:sym?`b`a`c`b)";1b)
+("M:get`:m77 set m:(2 3;4 0N;1 7)";::)
+("T:get`:tab/ set t:flip`a`b!flip m";::)
+("var each(m;M;t;T)";(1.555556 4;1.555556 4;`a`b!1.555556 4;`a`b!1.555556 4))
+("dev each(m;M;t;T)";(1.247219 2;1.247219 2;`a`b!1.247219 2;`a`b!1.247219 2))
+("svar each(m;M;t;T)";(2.333333 8;2.333333 8;`a`b!2.333333 8;`a`b!2.333333 8))
+("sdev each(m;M;t;T)";(1.527525 2.828427;1.527525 2.828427;`a`b!1.527525 2.82..
+("parse \"a:3\",1000000#\"0\"";(`err;"300000000000000000000000000000000000000..
+(".Q.dd[`:./db1;`2022.01.01`ecfmapping`] set .Q.en[`:./db1] ([]firmName:enlis..
+("l ./db1";::)
+("select ecfmap.firmName from ([id:1 2];ecfmap:`ecfmapping!1 1)";+(,`firmName..
+(".Q.id`$\"+\"";`a)
+("cols .Q.id(`$(\"count+\";\"count*\";\"count1\"))xcol([]1 2;3 4;5 6)";`count..
+("cols .Q.id(`$(\"aa\";\"=\";\"+\"))xcol([]1 2;3 4;5 6)";`aa`a`a1)
+(".[`:./db/t/;(0 1;`v)]";(`err;"type"))
+(".z.zd:17 2 6;`:file set();system\"x .z.zd\";`:file upsert 1000#0;-21!`:file..
+("(`:empty set())upsert 0 1";`:empty)
+("{x}[;1]";{x}[;1])
+("select sum a*(`aaf=`aaf)|(`aaf=`aaf)|(`aaf=`aaf) by b from ([]a:1 2;b:3 4)"..
+("h:hopen`:localhost:5000";::)
+("@[h;`:./a 2:`a,1;::] / attempting to send a dynamically loaded function";(`..
+("h\"1+2\"";3)
+("where 0W 0W 1 1";(`err;"limit"))
+(".z.zd:();`:./aaa set til 10";`:./aaa)
+("-25!(1#0N;\"aaa\")";(`err;"type"))
+("hopen[4000]\"reval(hdel;enlist`:somefile)\"";(`err;"timeout. 127.0.0.1:4000..
+("h:@[{hopen 4000};::;{x}]";::)
+("h\"reval(hopen;enlist`:somefile)\"";"     e                       ")
+("h\"hopen`:../somefile\"";"                  ")
+("hopen[4000]\"hopen`:fifo://../somefifo\"";(`err;"timeout. 127.0.0.1:4000: n..
+("r~.Q.gz .Q.gz(6;r:1000000?0x00)";1b)
+("0Nh~\"H\"$\" \"";1b)
+("0x0203 sv 0x0203 vs \"x\"$til 6";0x000102030405)
+("0x02 vs \"x\"$til 5";(0x0001;0x0304))
+("{x~0b sv 0b vs x}rand 0Ng";1b)
+("0Nh~\"H\"$\"32768\"";1b)
+("{x~\"c\"$.Q.gz .Q.gz(6;\"x\"$x)}10000#\"helloworld\"";1b)
+("0 wavg 0 1";0n)
+("\"0Wh\"~-3!0Wh";0b)
+("select last x by n:i from ([]([]a:enlist\"AB\")) where i=0";(+(,`n)!,`s#,0)..
+("-120!'.mm.a:1";(`err;"nyi"))
+("`:x set get `:x set (`s;{([]s:1)};`a`b;`g#`c`a`b;`a`b)";`:x)
+("a:(\"hi\";\"there\";\"world\");`:a0 set a;`:a1 set a@where 1000 2000 3000;(..
+("`:db/2000.01.01 `t";(`err;"type"))
+("update x:0 from get`:mysplay/";(`err;"io"))
+(".1 .2 .3 .4 .5 .6~.1 xbar .1 .2 .3 .4 .5 .6";0b)
+("4.4~1.1 xbar 5";1b)
+("1b~.z.r / in reval, -b cmd line (read-only), or a thread other than the mai..
+("t:([]`g#`a`b`c);.Q.dpt[`:db;2000.01.01;`t];`g~attr `:db/2000.01.01/t `x";(`..
+("H:hopen each 4#4000;{x\"\"}peach H";(`err;"timeout. 127.0.0.1:4000: no repl..
+("string[x]~raze string vs[10;x:\"j\"$2 xexp 55]";1b)
