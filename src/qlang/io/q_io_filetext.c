@@ -18,12 +18,15 @@
 #include "qlang/io/q_io.h"  /* the byte core: paths, the slice read, the write */
 #include "qlang/ops/q_dollar.h" /* q_cast_designator, q_dollar_tok — Tok column parses */
 #include "qlang/parse/q_tok.h"  /* q_tok — header names take the cells' blank trim */
+#include "qlang/base/q_calendar.h" /* civil->days for the csv fast path's DATE spans */
+#include "core/numparse.h"        /* ray_parse_i64/f64 — the csv fast path's numeric spans */
 #include "qlang/q_builtins.h" /* q_string_fn — Prepare Text cell text; q_io_filetext_csv_quote decl */
 #include "lang/eval.h"      /* ray_at_fn */
 #include "table/sym.h"      /* ray_sym_str */
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ---- Save Text: `:path 0: strings -------------------------------------- */
 static ray_t* ft_save_text(ray_t* fsym, ray_t* y) {
@@ -436,6 +439,388 @@ static ray_t* ft_finish_col(ray_t* colacc, int8_t tag, int is_str) {
     return v;
 }
 
+/* ---- the direct-parse fast path ---------------------------------------------
+ * The generic rows path boxes every field THREE times (field STR, column-
+ * accumulator STR, Tok atom) before the collapse — ~5 heap objects a field.
+ * When every kept column's tag parses a (ptr,len) span straight into its vec
+ * payload — the SAME scanners q_tok runs — the loader writes the element
+ * where it stands: no field objects, no accumulator.  A '*' column (is_str)
+ * or an unsupported tag sends the load back down the generic path. */
+
+static int ft_span_admits(int8_t tag) {
+    switch (tag) {
+    case RAY_BOOL: case RAY_BYTE_ONLY: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_F32: case RAY_F64: case RAY_CHARV: case RAY_SYM: case RAY_GUID:
+    case RAY_DATE: case RAY_MONTH: case RAY_TIME: case RAY_MINUTE: case RAY_SECOND:
+    case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_DATETIME:
+        return 1;
+    default: return 0;
+    }
+}
+
+/* Hot lane: a field span of pure digits of len<=3 resolves without the full
+ * ft_span_tok dispatch (same value law — anything else returns 0 -> caller
+ * falls back to ft_span_tok). */
+static inline int ft_span_fast(int8_t tag, const char* p, size_t len, uint8_t* d) {
+    if (len == 1) {
+        char c = p[0];
+        if (tag == RAY_CHARV) { *d = (uint8_t)c; return 1; }
+        if (c < '0' || c > '9') return 0;
+        switch (tag) {
+        case RAY_I64: *(int64_t*)d = c - '0'; return 1;
+        case RAY_I32: *(int32_t*)d = c - '0'; return 1;
+        case RAY_I16: *(int16_t*)d = (int16_t)(c - '0'); return 1;
+        case RAY_BOOL: *d = (uint8_t)(c == '1'); return 1;
+        case RAY_BYTE_ONLY: *d = (uint8_t)(c - '0'); return 1;   /* hex digit = value */
+        case RAY_MINUTE: *(int32_t*)d = (c - '0') * 60; return 1;
+        case RAY_F64: { double r = c - '0'; memcpy(d, &r, 8); return 1; }
+        case RAY_F32: { float r = c - '0'; memcpy(d, &r, 4); return 1; }
+        default: return 0;
+        }
+    }
+    if (len > 3 || len == 0) return 0;
+    int64_t v = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = p[i];
+        if (c < '0' || c > '9') return 0;
+        v = v * 10 + (c - '0');
+    }
+    switch (tag) {
+    case RAY_I64: *(int64_t*)d = v; return 1;
+    case RAY_I32: *(int32_t*)d = (int32_t)v; return 1;
+    case RAY_I16: *(int16_t*)d = (int16_t)v; return 1;
+    case RAY_MINUTE: *(int32_t*)d = (int32_t)(v * 60); return 1;
+    case RAY_F64: { double r = (double)v; memcpy(d, &r, 8); return 1; }
+    case RAY_F32: { float r = (float)v; memcpy(d, &r, 4); return 1; }
+    default: return 0;
+    }
+}
+
+/* One field span -> typed payload at `d`, identical value law to q_tok (same
+ * scanners, same trims, unparseable/out-of-domain -> the typed null's bytes). */
+static void ft_span_tok(int8_t tag, const char* p, size_t len, uint8_t* d) {
+    while (len && *p == ' ') { p++; len--; }
+    while (len && p[len - 1] == ' ') len--;
+    switch (tag) {
+    case RAY_BOOL: { uint8_t b = len == 1 && strchr("1TtXxYy", p[0]) != NULL; *d = b; return; }
+    case RAY_BYTE_ONLY: {
+        uint64_t v = 0;
+        size_t i = 0;
+        for (; i < len; i++) {
+            char c = p[i];
+            int dg = (c >= '0' && c <= '9') ? c - '0'
+                   : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+                   : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+            if (dg < 0) break;
+            v = (v << 4) | (uint64_t)dg;
+            if (v > 0xff) break;
+        }
+        *d = (len == 0 || i != len || v > 0xff) ? 0 : (uint8_t)v;
+        return;
+    }
+    case RAY_I64: {
+        int64_t v = 0;
+        size_t u = len ? ray_parse_i64(p, len, &v) : 0;
+        *(int64_t*)d = (!len || u != len || v == INT64_MIN) ? NULL_I64 : v;
+        return;
+    }
+    case RAY_I32: {
+        uint32_t ip;
+        if (q_tok_ipv4(p, len, &ip)) { *(int32_t*)d = (int32_t)ip; return; }
+        int64_t v = 0;
+        size_t u = len ? ray_parse_i64(p, len, &v) : 0;
+        *(int32_t*)d = (!len || u != len || v > INT32_MAX || v < -INT32_MAX) ? NULL_I32 : (int32_t)v;
+        return;
+    }
+    case RAY_I16: {
+        int64_t v = 0;
+        size_t u = len ? ray_parse_i64(p, len, &v) : 0;
+        *(int16_t*)d = (!len || u != len || v > INT16_MAX || v < -INT16_MAX) ? NULL_I16 : (int16_t)v;
+        return;
+    }
+    case RAY_F64: case RAY_F32: {
+        double v = 0;
+        size_t u = len ? ray_parse_f64(p, len, &v) : 0;
+        int bad = !len || u != len;
+        if (tag == RAY_F64) { double r = bad ? NULL_F64 : v; memcpy(d, &r, 8); }
+        else { float r = bad ? NULL_F32 : (float)v; memcpy(d, &r, 4); }
+        return;
+    }
+    case RAY_CHARV: { *d = len ? (uint8_t)p[0] : 0x20; return; }
+    case RAY_SYM: { *(int64_t*)d = ray_sym_intern(len ? p : "", len); return; }
+    case RAY_GUID: {
+        uint8_t bytes[16];
+        if (!q_tok_uuid(p, len, bytes) && !tok_ip_guid(p, len, bytes)) memset(bytes, 0, 16);
+        memcpy(d, bytes, 16);
+        return;
+    }
+    case RAY_DATE: {
+        int64_t y, mo, dy;
+        *(int32_t*)d = q_tok_date(p, len, &y, &mo, &dy) && q_calendar_date_valid(y, mo, dy)
+                     ? (int32_t)q_calendar_days_from_civil(y, mo, dy) : NULL_I32;
+        return;
+    }
+    case RAY_MONTH: {
+        int64_t mo;
+        *(int32_t*)d = q_tok_month(p, len, &mo) ? (int32_t)mo : NULL_I32;
+        return;
+    }
+    case RAY_TIME: {
+        int32_t ms;
+        *(int32_t*)d = q_tok_time(p, len, &ms) ? ms : NULL_I32;
+        return;
+    }
+    case RAY_MINUTE: {
+        int64_t secs, frac;
+        *(int32_t*)d = len && len <= 2 && p[0] >= '0' && p[0] <= '9' &&
+                       (len == 1 || (p[1] >= '0' && p[1] <= '9'))
+                       ? (int32_t)((len == 1 ? p[0] - '0' : (p[0] - '0') * 10 + p[1] - '0') * 60)
+                       : q_tok_clock(p, len, &secs, &frac) && secs / 60 <= INT32_MAX
+                         ? (int32_t)(secs / 60) : NULL_I32;
+        return;
+    }
+    case RAY_SECOND: {
+        int64_t secs, frac;
+        *(int32_t*)d = q_tok_clock(p, len, &secs, &frac) && secs <= INT32_MAX
+                     ? (int32_t)secs : NULL_I32;
+        return;
+    }
+    case RAY_TIMESPAN: {
+        int64_t ns;
+        *(int64_t*)d = q_tok_timespan_ns(p, len, &ns) ? ns : NULL_I64;
+        return;
+    }
+    case RAY_TIMESTAMP: case RAY_DATETIME: {
+        int64_t ns;
+        if (len && p[len - 1] == 'D') {
+            int64_t y, mo, dy;
+            if (q_tok_date(p, len - 1, &y, &mo, &dy)) len--;   /* the bare-D strip (tok_ts_bare_d) */
+        }
+        if (!q_tok_ts(p, len, &ns)) {
+            if (tag == RAY_TIMESTAMP) *(int64_t*)d = NULL_I64;
+            else { double r = NULL_F64; memcpy(d, &r, 8); }
+            return;
+        }
+        if (tag == RAY_TIMESTAMP) *(int64_t*)d = ns;
+        else { double r = (double)ns / 86400000000000.0; memcpy(d, &r, 8); }
+        return;
+    }
+    default: memset(d, 0, 8); return;
+    }
+}
+
+/* Rows -> column vecs, writing each field's payload in place (the fast path).
+ * Rows arrive WITHOUT materializing a LIST of STR atoms: a RAY_STR vector's
+ * `ray_str_vec_get`, a LIST's STR items, or the '\n' lines of one text buffer
+ * (q_str_split_lines' law: '\r' stripped, the segment after a terminal '\n'
+ * dropped).  `tags`/`fskip`/`nt` as ft_load_csv computes them.  Returns the
+ * OWNED list of `nout` column vecs, or an error. */
+#define FT_ROWS_STRVEC 1
+#define FT_ROWS_LIST   2
+#define FT_ROWS_TEXT   3
+static ray_t* ft_load_fast(ray_t* y, ray_t** items, const char* text, size_t tlen, int mode,
+                           int64_t nrows, int64_t first, char delim,
+                           const int8_t* tags, const int* fskip, size_t nt,
+                           int64_t nout, int64_t ndata) {
+    ray_t* cols = ray_list_new(nout > 0 ? nout : 1);
+    if (!cols || RAY_IS_ERR(cols)) return cols ? cols : q_err(QE_OOM);
+    ray_t** cv = (ray_t**)ray_data(cols);
+    int64_t c = 0;
+    for (size_t j = 0; j < nt; j++) {
+        if (fskip[j]) continue;
+        ray_t* v = ray_vec_new(tags[j], ndata > 0 ? ndata : 1);
+        if (!v || RAY_IS_ERR(v)) { ray_release(cols); return v ? v : q_err(QE_OOM); }
+        v->len = ndata;
+        cols = ray_list_append(cols, v);
+        ray_release(v);
+        if (RAY_IS_ERR(cols)) return cols;
+        cv = (ray_t**)ray_data(cols);           /* append may have moved the slots */
+        c++;
+    }
+    char* scratch = NULL;
+    size_t scap = 0;
+    if (mode == FT_ROWS_TEXT) {
+        /* single fused pass: fields delimited by delim-or-'\n', writes go
+         * through per-column cursors — no per-row string materialization or
+         * second line scan. */
+        size_t tpos = 0;
+        for (int64_t i = 0; i < first && tpos < tlen; i++) {
+            while (tpos < tlen && text[tpos] != '\n') tpos++;
+            if (tpos < tlen) tpos++;
+        }
+        int8_t* wtag = (int8_t*)malloc((size_t)(nout ? nout : 1) * sizeof(int8_t));
+        size_t* wesz = (size_t*)malloc((size_t)(nout ? nout : 1) * sizeof(size_t));
+        uint8_t** wdst = (uint8_t**)malloc((size_t)(nout ? nout : 1) * sizeof(uint8_t*));
+        if (!wtag || !wesz || !wdst) {
+            free(wtag); free(wesz); free(wdst); ray_release(cols); return q_err(QE_OOM);
+        }
+        {
+            int64_t ci = 0;
+            for (size_t j = 0; j < nt; j++) {
+                if (fskip[j]) continue;
+                wtag[ci] = tags[j];
+                wesz[ci] = ray_type_sizes[(uint8_t)tags[j]];
+                wdst[ci] = (uint8_t*)ray_data(cv[ci]);
+                ci++;
+            }
+        }
+        int64_t rows_done = 0;
+        while (tpos < tlen && rows_done < ndata) {
+            size_t j = 0;
+            int64_t ci = 0;
+            while (tpos < tlen) {
+                if (text[tpos] == '\n') { tpos++; break; }
+                const char* sp;
+                size_t sl;
+                int nl_end = 0;
+                int stored = 0;
+                /* fused digit lane: scan and value in one pass for the int family */
+                if (j < nt && !fskip[j] && wtag[ci] >= RAY_I16 && wtag[ci] <= RAY_I64 &&
+                    text[tpos] >= '0' && text[tpos] <= '9') {
+                    int maxd = wtag[ci] == RAY_I64 ? 18 : wtag[ci] == RAY_I32 ? 9 : 4;
+                    size_t e = tpos;
+                    int64_t v = 0;
+                    int nd = 0, clean = 1;
+                    while (e < tlen) {
+                        char c = text[e];
+                        if (c >= '0' && c <= '9') { if (nd < 19) { v = v * 10 + (c - '0'); nd++; } else clean = 0; e++; }
+                        else break;
+                    }
+                    if (clean && nd && nd <= maxd &&
+                        (e == tlen || text[e] == delim || text[e] == '\n')) {
+                        if (wtag[ci] == RAY_I64) *(int64_t*)wdst[ci] = v;
+                        else if (wtag[ci] == RAY_I32) *(int32_t*)wdst[ci] = (int32_t)v;
+                        else *(int16_t*)wdst[ci] = (int16_t)v;
+                        wdst[ci] += wesz[ci]; ci++;
+                        stored = 1;
+                        nl_end = e < tlen && text[e] == '\n';
+                        tpos = e;
+                    }
+                }
+                if (!stored && text[tpos] == '"') {
+                    /* ft_fields' quoted arm, unescaped into scratch */
+                    size_t e = tpos, w = 0;
+                    int quoted = 0;
+                    while (e < tlen && text[e] != '\n' && (quoted || text[e] != delim)) {
+                        if (text[e] != '"') {
+                            if (w >= scap) {
+                                size_t nc = scap ? scap * 2 : 256;
+                                char* nb = (char*)realloc(scratch, nc);
+                                if (!nb) { free(scratch); free(wtag); free(wesz); free(wdst); ray_release(cols); return q_err(QE_OOM); }
+                                scratch = nb; scap = nc;
+                            }
+                            scratch[w++] = text[e++];
+                        } else if (quoted && e + 1 < tlen && text[e + 1] == '"') {
+                            if (w >= scap) {
+                                size_t nc = scap ? scap * 2 : 256;
+                                char* nb = (char*)realloc(scratch, nc);
+                                if (!nb) { free(scratch); free(wtag); free(wesz); free(wdst); ray_release(cols); return q_err(QE_OOM); }
+                                scratch = nb; scap = nc;
+                            }
+                            scratch[w++] = '"'; e += 2;
+                        } else { quoted = !quoted; e++; }
+                    }
+                    sp = scratch ? scratch : "";
+                    sl = w;
+                    tpos = e;
+                    nl_end = e < tlen && text[e] == '\n';
+                } else if (!stored) {
+                    size_t e = tpos;
+                    while (e < tlen && text[e] != delim && text[e] != '\n') e++;
+                    nl_end = e < tlen && text[e] == '\n';
+                    sp = text + tpos;
+                    sl = e - tpos;
+                    if (nl_end && sl && text[tpos + sl - 1] == '\r') sl--;
+                    tpos = e;
+                }
+                if (j < nt && !stored) {
+                    if (!fskip[j]) {
+                        if (!ft_span_fast(wtag[ci], sp, sl, wdst[ci]))
+                            ft_span_tok(wtag[ci], sp, sl, wdst[ci]);
+                        wdst[ci] += wesz[ci]; ci++;
+                    }
+                }
+                j++;
+                if (tpos < tlen) {
+                    if (nl_end || text[tpos] == '\n') { tpos++; break; }
+                    if (text[tpos] == delim) { tpos++; continue; }
+                }
+                break;
+            }
+            /* short row: the untouched columns take the empty-field null */
+            while (j < nt) {
+                if (!fskip[j]) { ft_span_tok(wtag[ci], "", 0, wdst[ci]); wdst[ci] += wesz[ci]; ci++; }
+                j++;
+            }
+            rows_done++;
+        }
+        free(scratch); free(wtag); free(wesz); free(wdst);
+        return cols;
+    }
+    for (int64_t i = first; i < nrows; i++) {
+        size_t rn = 0;
+        const char* rr;
+        if (mode == FT_ROWS_LIST) {
+            rr = ray_str_ptr(items[i]);
+            rn = ray_str_len(items[i]);
+        } else {
+            rr = ray_str_vec_get(y, i, &rn);
+            if (!rr) { rr = ""; rn = 0; }
+        }
+        size_t fi = 0;
+        int64_t ri = i - first;
+        int64_t ci = 0;
+        for (size_t j = 0; j < nt; j++) {
+            const char* sp = "";
+            size_t sl = 0;
+            if (fi < rn) {
+                if (rr[fi] == '"') {
+                    /* ft_fields' quoted arm, unescaped into scratch */
+                    size_t e = fi, w = 0;
+                    int quoted = 0;
+                    while (e < rn && (quoted || rr[e] != delim)) {
+                        if (rr[e] != '"') {
+                            if (w >= scap) {
+                                size_t nc = scap ? scap * 2 : 256;
+                                char* nb = (char*)realloc(scratch, nc);
+                                if (!nb) { free(scratch); ray_release(cols); return q_err(QE_OOM); }
+                                scratch = nb; scap = nc;
+                            }
+                            scratch[w++] = rr[e++];
+                        } else if (quoted && e + 1 < rn && rr[e + 1] == '"') {
+                            if (w >= scap) {
+                                size_t nc = scap ? scap * 2 : 256;
+                                char* nb = (char*)realloc(scratch, nc);
+                                if (!nb) { free(scratch); ray_release(cols); return q_err(QE_OOM); }
+                                scratch = nb; scap = nc;
+                            }
+                            scratch[w++] = '"'; e += 2;
+                        } else { quoted = !quoted; e++; }
+                    }
+                    sp = scratch ? scratch : "";
+                    sl = w;
+                    fi = e;
+                } else {
+                    size_t e = fi;
+                    while (e < rn && rr[e] != delim) e++;
+                    sp = rr + fi;
+                    sl = e - fi;
+                    fi = e;
+                }
+            }
+            if (!fskip[j]) {
+                size_t esz = ray_type_sizes[(uint8_t)tags[j]];
+                uint8_t* d = (uint8_t*)ray_data(cv[ci]) + (size_t)ri * esz;
+                if (!ft_span_fast(tags[j], sp, sl, d)) ft_span_tok(tags[j], sp, sl, d);
+                ci++;
+            }
+            if (fi < rn) fi++;                    /* past delim; fi==rn leaves later fields "" */
+        }
+    }
+    free(scratch);
+    return cols;
+}
+
 static ray_t* ft_load_csv(ray_t* types, ray_t* delimspec, ray_t* flag, ray_t* y) {
     const char* ts = ray_str_ptr(types);
     size_t nt = ray_str_len(types);
@@ -484,15 +869,52 @@ static ray_t* ft_load_csv(ray_t* types, ray_t* delimspec, ray_t* flag, ray_t* y)
             return q_err(QE_TYPE);
         }
     }
-    int single = 0;
-    ray_t* rows = ft_rows(y, &single);
-    if (!rows || RAY_IS_ERR(rows)) { free(tags); free(fstr); free(fskip); return rows; }
-    if (embed_nl) {
-        rows = ft_merge_quoted(rows);
-        if (!rows || RAY_IS_ERR(rows)) { free(tags); free(fstr); free(fskip); return rows; }
+    /* fast path gate: every kept column parses spans in place AND the row text
+     * is reachable without boxing — one -RAY_STR's '\n' lines, a RAY_STR
+     * vector, or a LIST of STRs. */
+    int fast = !embed_nl;
+    for (size_t j = 0; j < nt && fast; j++)
+        if (fstr[j] || (!fskip[j] && !ft_span_admits(tags[j]))) fast = 0;
+    int fmode = 0;
+    ray_t** fitems = NULL;
+    const char* ftext = NULL;
+    size_t ftlen = 0;
+    int64_t nrows = 0;
+    if (fast) {
+        if (y->type == -RAY_STR && memchr(ray_str_ptr(y), '\n', ray_str_len(y))) {
+            fmode = FT_ROWS_TEXT;
+            ftext = ray_str_ptr(y);
+            ftlen = ray_str_len(y);
+            int64_t nl = 0;
+            for (size_t k = 0; k < ftlen; k++) nl += ftext[k] == '\n';
+            nrows = nl + 1;
+            if (ftext[ftlen - 1] == '\n') nrows--;   /* the post-terminal-'\n' segment drops */
+        } else if (y->type == RAY_STR) {
+            fmode = FT_ROWS_STRVEC;
+            nrows = q_count(y);
+        } else if (y->type == RAY_LIST) {
+            fmode = FT_ROWS_LIST;
+            nrows = q_count(y);
+            ray_t** e = (ray_t**)ray_data(y);
+            for (int64_t i = 0; i < nrows; i++)
+                if (!e[i] || e[i]->type != -RAY_STR) { fast = 0; fmode = 0; break; }
+            fitems = e;
+        } else fast = 0;
     }
-    ray_t** rp = (ray_t**)ray_data(rows);
-    int64_t nrows = q_count(rows);
+    if (!fast) fmode = 0;
+    int single = 0;
+    ray_t* rows = NULL;
+    ray_t** rp = NULL;
+    if (!fast) {
+        rows = ft_rows(y, &single);
+        if (!rows || RAY_IS_ERR(rows)) { free(tags); free(fstr); free(fskip); return rows; }
+        if (embed_nl) {
+            rows = ft_merge_quoted(rows);
+            if (!rows || RAY_IS_ERR(rows)) { free(tags); free(fstr); free(fskip); return rows; }
+        }
+        rp = (ray_t**)ray_data(rows);
+        nrows = q_count(rows);
+    }
     ray_t* result = NULL;
     if (single) {
         /* one delimited string -> list of parsed atoms */
@@ -525,6 +947,49 @@ static ray_t* ft_load_csv(ray_t* types, ray_t* delimspec, ray_t* flag, ray_t* y)
         if (ndata < 0) ndata = 0;
         int64_t nout = 0;
         for (size_t j = 0; j < nt; j++) if (!fskip[j]) nout++;
+        if (fast) {
+            result = ft_load_fast(y, fitems, ftext, ftlen, fmode, nrows, first, delim,
+                                  tags, fskip, nt, nout, ndata);
+            if (result && !RAY_IS_ERR(result) && header) {
+                /* header: first row = column names -> table */
+                ray_t* cols = result;
+                ray_t* nmf = ray_list_new((int64_t)nt);
+                size_t h0 = 0;
+                const char* hp = NULL;
+                if (nrows > 0) {
+                    if (fmode == FT_ROWS_LIST) { hp = ray_str_ptr(fitems[0]); h0 = ray_str_len(fitems[0]); }
+                    else if (fmode == FT_ROWS_TEXT) {
+                        hp = ftext;
+                        h0 = 0;
+                        while (h0 < ftlen && ftext[h0] != '\n') h0++;
+                        if (h0 && ftext[h0 - 1] == '\r') h0--;
+                    }
+                    else hp = ray_str_vec_get(y, 0, &h0);
+                }
+                if (!RAY_IS_ERR(nmf) && nrows > 0)
+                    nmf = ft_fields(nmf, hp ? hp : "", h0, delim);
+                if (RAY_IS_ERR(nmf)) { ray_release(cols); result = nmf; goto done; }
+                ray_t** np = (ray_t**)ray_data(nmf);
+                int64_t nn = q_count(nmf);
+                ray_t* tbl = ray_table_new(nout > 0 ? nout : 1);
+                int64_t c2 = 0;
+                ray_t** cp = (ray_t**)ray_data(cols);
+                for (size_t j = 0; j < nt && !RAY_IS_ERR(tbl); j++) {
+                    if (fskip[j]) continue;
+                    ray_t* nm = (int64_t)j < nn
+                        ? q_tok(RAY_SYM, ray_str_ptr(np[j]), ray_str_len(np[j]))
+                        : q_tok(RAY_SYM, "", 0);
+                    if (!nm || RAY_IS_ERR(nm)) { ray_release(tbl); tbl = nm ? nm : q_err(QE_OOM); break; }
+                    tbl = ray_table_add_col(tbl, nm->i64, cp[c2]);
+                    ray_release(nm);
+                    c2++;
+                }
+                ray_release(nmf);
+                ray_release(cols);
+                result = tbl;
+            }
+            goto done;
+        }
         ray_t** acc = (ray_t**)calloc((size_t)(nout > 0 ? nout : 1), sizeof(ray_t*));
         if (!acc) { result = q_err(QE_OOM); goto done; }
         int64_t k = 0;

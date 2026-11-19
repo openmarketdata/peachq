@@ -866,7 +866,7 @@ static int tok_ipv6(const char* p, size_t len, uint8_t out[16]) {
 /* "G"$ IP-address forms -> 16-byte guid: a bare dotted-quad maps to ::ffff:v4
  * ("192.0.2.1" -> 00000000-0000-0000-0000-ffffc0000201), else IPv6.  Returns
  * 1 + out, 0 on mismatch (caller yields 0Ng). */
-static int tok_ip_guid(const char* p, size_t len, uint8_t out[16]) {
+int tok_ip_guid(const char* p, size_t len, uint8_t out[16]) {
     uint8_t o4[4];
     if (tok_ipv4_octets(p, len, o4)) {
         memset(out, 0, 16);

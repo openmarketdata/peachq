@@ -69,5 +69,6 @@ int q_tok_timespan_ns(const char* p, size_t len, int64_t* ns);
 int q_tok_ts(const char* p, size_t len, int64_t* out);
 int q_tok_uuid(const char* p, size_t len, uint8_t out[16]);
 int q_tok_ipv4(const char* p, size_t len, uint32_t* out);   /* dotted-quad -> BE int */
+int tok_ip_guid(const char* p, size_t len, uint8_t out[16]);  /* ip literal -> guid bytes (the "G"$ fallback) */
 
 #endif /* Q_TOK_H */
