@@ -244,11 +244,12 @@ void q_io_mkdir_parents(const char* path, size_t n) {
 }
 
 int q_io_fwrite(FILE* fp, const void* bytes, size_t n) {
-    uint8_t buf[65536];
+    /* Large requests go straight to write() — no bounce buffer, no extra
+     * memcpy.  Chunking at 4MB keeps partial-write handling simple and
+     * large enough that per-syscall cost stays amortized. */
     for (size_t off = 0; off < n; ) {
-        size_t c = n - off < sizeof buf ? n - off : sizeof buf;
-        memcpy(buf, (const uint8_t*)bytes + off, c);
-        if (fwrite(buf, 1, c, fp) != c) return -1;
+        size_t c = n - off < 4194304 ? n - off : 4194304;
+        if (fwrite((const uint8_t*)bytes + off, 1, c, fp) != c) return -1;
         off += c;
     }
     return 0;
