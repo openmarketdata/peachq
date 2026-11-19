@@ -505,12 +505,44 @@ ray_t* q_dollar_cast(int8_t tag, ray_t* x) {
         return r;
     }
     /* general (boxed) list: cast each element, then collapse — typed vectors
-     * are leaves the switch below hits WHOLE (vectorized kernels). */
+     * are leaves the switch below hits WHOLE (vectorized kernels).
+     * Fast path: when EVERY cast result is a -tag atom the collapse is a
+     * pure pack — write the payload + null flag straight into the typed
+     * vector, skipping the boxed list, its appends, and the re-scan. */
     if (x && x->type == RAY_LIST) {
         int64_t n = q_count(x);
+        ray_t** e = (ray_t**)ray_data(x);
+        if (tag != RAY_LIST && tag != RAY_STR && tag != RAY_ENUM) {
+            ray_t* vec = tag == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W64, n)
+                                        : ray_vec_new(tag, n);
+            if (RAY_IS_ERR(vec)) return vec;
+            vec->len = n;
+            int64_t i = 0;
+            for (; i < n; i++) {
+                ray_t* r = q_dollar_cast(tag, e[i]);
+                if (!r || RAY_IS_ERR(r)) { ray_release(vec); return r ? r : q_err(QE_TYPE); }
+                if (r->type != -tag) { ray_release(r); break; }
+                void* base = ray_data(vec);
+                switch ((ray_type_e)tag) {      /* same payload field as q_list_collapse_atoms */
+                case RAY_BOOL: case RAY_BYTE_ONLY: case RAY_CHARV:
+                    ((uint8_t*)base)[i] = tag == RAY_BOOL ? r->b8 : r->u8; break;
+                case RAY_I16:  ((int16_t*)base)[i] = r->i16; break;
+                case RAY_I32:  ((int32_t*)base)[i] = r->i32; break;
+                case RAY_F32:  ((float*)base)[i] = (float)r->f64; break;
+                case RAY_F64: case RAY_DATETIME: ((double*)base)[i] = r->f64; break;
+                case RAY_GUID: memcpy((uint8_t*)base + i * 16, ray_guid_bytes(r), 16); break;
+                case RAY_LIST: case RAY_STR: case RAY_ENUM: break;   /* unreachable */
+                default: ((int64_t*)base)[i] = r->i64; break;
+                }
+                if (RAY_ATOM_IS_NULL(r)) ray_vec_set_null(vec, i, true);
+                ray_release(r);
+            }
+            if (i == n) return vec;
+            vec->len = 0;
+            ray_release(vec);       /* a cast produced a non--tag value: distribute */
+        }
         ray_t* out = ray_list_new(n);
         if (RAY_IS_ERR(out)) return out;
-        ray_t** e = (ray_t**)ray_data(x);
         for (int64_t i = 0; i < n; i++) {
             ray_t* r = q_dollar_cast(tag, e[i]);
             if (!r || RAY_IS_ERR(r)) { ray_release(out); return r ? r : q_err(QE_TYPE); }
