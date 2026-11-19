@@ -1104,6 +1104,7 @@ static ray_t* cast_vec_numeric_fast(ray_t* val, ray_t* vec, int8_t out_type);
 static void cast_mark_output_sentinels(ray_t* vec, int8_t out_type, int64_t n);
 
 static ray_t* cast_vec_temporal_elems(ray_t* val, int8_t out_type) {
+    if (val->type == out_type) { ray_retain(val); return val; }
     int64_t n = ray_len(val);
     ray_t* out = ray_vec_new(out_type, n);
     if (!out || RAY_IS_ERR(out)) return out;
@@ -1307,6 +1308,10 @@ static void cast_mark_output_sentinels(ray_t* vec, int8_t out_type, int64_t n) {
 }
 
 static ray_t* cast_vec_numeric(ray_t* val, int8_t out_type) {
+    /* Same-type vec: the atom arms return the input for identity casts;
+     * the vec arm does the same (COW keeps the alias safe) instead of a
+     * full memcpy relabel. */
+    if (val->type == out_type) { ray_retain(val); return val; }
     int64_t n2 = val->len;
     ray_t* vec = ray_vec_new(out_type, n2);
     if (RAY_IS_ERR(vec)) return vec;
