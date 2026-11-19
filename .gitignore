@@ -19,3 +19,7 @@ src/qlang/dotq_gen.h
 .vscode/
 tests/.c4run/
 tab/
+
+# Benchmark scratch files written to cwd by perf probes
+# Benchmark scratch files written to cwd by perf probes
+/f4*
