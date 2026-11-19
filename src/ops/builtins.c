@@ -530,6 +530,12 @@ static ray_t* cast_vec_copy_nulls(ray_t* vec, ray_t* val) {
                     if (ray_vec_is_null(val, j)) d[j] = NULL_F64;
                 break;
             }
+            case RAY_F32: {
+                float* d = (float*)ray_data(vec);
+                for (int64_t j = 0; j < vec->len; j++)
+                    if (ray_vec_is_null(val, j)) d[j] = NULL_F32;
+                break;
+            }
             case RAY_I64: RAY_TEMPORAL64_CASES: {
                 int64_t* d = (int64_t*)ray_data(vec);
                 for (int64_t j = 0; j < vec->len; j++)
@@ -826,6 +832,19 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
                         CL(int64_t,  uint8_t, (uint8_t)_v);
         case RAY_F32:   CL(float,    uint8_t, (uint8_t)_v);
         case RAY_F64:   CL(double,   uint8_t, (uint8_t)_v);
+        }
+        break;
+    case RAY_F32:
+        switch (in_type) {
+        case RAY_BOOL:  CL(uint8_t,  float, _v ? 1.0f : 0.0f);
+        case RAY_BYTE_ONLY: CL(uint8_t,  float, (float)_v);
+        case RAY_I16:   CL(int16_t,  float, (float)_v);
+        case RAY_I32: RAY_TEMPORAL32_CASES:
+                        CL(int32_t,  float, (float)_v);
+        case RAY_I64: RAY_TEMPORAL64_CASES:
+                        CL(int64_t,  float, (float)_v);
+        case RAY_F64: RAY_TEMPORALF_CASES:
+                        CL(double,   float, (float)_v);
         }
         break;
     case RAY_F64: RAY_TEMPORALF_CASES:
@@ -1167,6 +1186,7 @@ static ray_t* cast_vec_numeric(ray_t* val, int8_t out_type) {
         case RAY_BYTE_ONLY: ((uint8_t*)out)[i] = cast->u8;  break;
         case RAY_F64: RAY_TEMPORALF_CASES:
                        ((double*)out)[i]  = cast->f64;  break;
+        case RAY_F32: ((float*)out)[i]  = (float)cast->f64;  break;
         case RAY_BOOL: ((bool*)out)[i]    = cast->b8;   break;
         default: break;
         }
@@ -1235,7 +1255,7 @@ ray_t* ray_cast_tag(int8_t tag, ray_t* val) {
     if (ray_is_atom(val) && RAY_ATOM_IS_NULL(val)) {
         switch (tag) {
         case RAY_I64: case RAY_I32: case RAY_I16: case RAY_BYTE_ONLY:
-        case RAY_F64: case RAY_BOOL: case RAY_SYM: case RAY_DATE:
+        case RAY_F64: case RAY_F32: case RAY_BOOL: case RAY_SYM: case RAY_DATE:
         case RAY_MONTH: case RAY_DATETIME: case RAY_MINUTE: case RAY_SECOND:
         case RAY_TIMESPAN: case RAY_TIME: case RAY_TIMESTAMP: case RAY_GUID:
             return ray_typed_null((int8_t)-tag);
@@ -1345,6 +1365,34 @@ ray_t* ray_cast_tag(int8_t tag, ray_t* val) {
         if (ray_is_vec(val) || val->type == RAY_LIST)
             return cast_vec_numeric(val, RAY_F64);
         return ray_error("type", "as: cannot cast %s to f64", ray_type_name(val->type));
+    }
+    /* Cast to F32 / f32 (real).  Same lanes as F64, narrowed through `float`
+     * — identical to the old q_cast_real F64-then-narrow bridge except i64
+     * sources, which now single-round ((float)v instead of (float)(double)v):
+     * the IEEE-correct result and what kdb produces. */
+    case RAY_F32: {
+        if (val->type == -RAY_F32) { ray_retain(val); return val; }
+        if (val->type == -RAY_F64 || RAY_IS_TEMPORALF(-val->type))
+            return ray_f32((float)val->f64);
+        if (val->type == -RAY_BOOL) return ray_f32(val->b8 ? 1.0f : 0.0f);
+        if (val->type == -RAY_I64) return ray_f32((float)val->i64);
+        if (val->type == -RAY_I32 || RAY_IS_TEMPORAL32(-val->type))
+            return ray_f32((float)val->i32);
+        if (RAY_IS_TEMPORAL64(-val->type)) return ray_f32((float)val->i64);
+        if (val->type == -RAY_I16) return ray_f32((float)val->i16);
+        if (val->type == -RAY_BYTE_ONLY)  return ray_f32((float)val->u8);
+        if (val->type == -RAY_STR) {
+            const char* sp = ray_str_ptr(val);
+            if (!sp) return ray_error("domain", "as: cannot parse empty str as f32");
+            char* end;
+            double v = strtod(sp, &end);
+            if (end == sp) return ray_error("domain", "as: cannot parse str as f32");
+            return ray_f32((float)v);
+        }
+        /* Vector cast */
+        if (ray_is_vec(val) || val->type == RAY_LIST)
+            return cast_vec_numeric(val, RAY_F32);
+        return ray_error("type", "as: cannot cast %s to f32", ray_type_name(val->type));
     }
     /* Cast to B8/BOOL/b8 */
     case RAY_BOOL: {

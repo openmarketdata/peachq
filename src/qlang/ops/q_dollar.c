@@ -70,6 +70,7 @@ static const char* cast_rayname(int8_t tag) {
     case RAY_BOOL: return "BOOL";   case RAY_BYTE_ONLY: return "U8";
     case RAY_I16: return "I16";     case RAY_I32: return "I32";
     case RAY_I64: return "I64";     case RAY_F64: return "F64";
+    case RAY_F32: return "F32";
     case RAY_DATE: return "DATE";   case RAY_TIME: return "TIME";
     case RAY_MONTH: return "MONTH"; case RAY_MINUTE: return "MINUTE";
     case RAY_SECOND: return "SECOND";       case RAY_TIMESPAN: return "TIMESPAN";
@@ -185,33 +186,11 @@ static ray_t* cast_str(ray_t* x) {
  * cond/cast_cond_simple:9) where rayfall `as` truncates, so pre-round via rint()
  * here; the rest is base's.  (The timestored guide's `int$100.5 -> 101 is a
  * third-party error — real kdb gives 100 by banker's rounding.) */
-/* Real (float32) target.  Base rayfall has an `as float` (F64) arm but no
- * `real`/F32 one, so `"e"$` used to 'nyi. Reuse the base F64 cast (handles every
- * numeric input + string parse, exactly like `"f"$`), then narrow F64 -> F32. */
+/* Real (float32) target.  The engine now has a first-class F32 cast arm
+ * (ray_cast_tag's RAY_F32 case + cast_range_worker leaves), so this is a
+ * plain delegate — no F64 intermediate vector, no narrowing pass. */
 static ray_t* q_cast_real(ray_t* x) {
-    ray_t* f = cast_delegate(RAY_F64, x);
-    if (RAY_IS_ERR(f)) return f;
-    if (f->type == -RAY_F64) {                              /* atom */
-        ray_t* r = RAY_ATOM_IS_NULL(f) ? ray_typed_null(-RAY_F32)
-                                       : ray_f32((float)f->f64);
-        ray_release(f);
-        return r;
-    }
-    if (f->type == RAY_F64) {                               /* vector */
-        int64_t n = q_count(f);
-        ray_t* out = ray_vec_new(RAY_F32, n);
-        if (RAY_IS_ERR(out)) { ray_release(f); return out; }
-        out->len = n;
-        const double* src = (const double*)ray_data(f);
-        for (int64_t i = 0; i < n; i++) {
-            double v = src[i];
-            ((float*)ray_data(out))[i] = (float)v;
-            if (isnan(v)) ray_vec_set_null(out, i, true);
-        }
-        ray_release(f);
-        return out;
-    }
-    return f;
+    return cast_delegate(RAY_F32, x);
 }
 
 /* A float beyond the target's range, ±inf included, saturates to its ±0W (`long$0w` -> 0W; the infinity

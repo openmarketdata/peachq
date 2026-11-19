@@ -30,6 +30,14 @@ run[`sym_char_atom; "t:1000000 `$`char$0x0a0b0c"];
 run[`char_bytevec;  "t:100 `char$bv"];          / bulk byte->char copy
 run[`char_boxed;    "t:10 \"c\"$LB"];           / boxed-atom char pack
 
+/ --- real/F32 target: direct engine leaves vs F64-intermediate + narrow ---
+i64v:`long$bv; i32v:`int$bv; f64v:`float$bv; f32v:`real$bv;  / typed sources
+run[`real_byte;    "t:100 `real$bv"];           / byte -> f32 direct leaf
+run[`real_i64;     "t:100 `real$i64v"];         / i64 -> f32 (single rounding)
+run[`real_i32;     "t:100 `real$i32v"];         / i32 -> f32
+run[`real_f64;     "t:100 `real$f64v"];         / f64 -> f32 narrow only
+run[`real_f32;     "t:100 `real$f32v"];         / identity relabel memcpy
+
 / --- name/dict lookups: every path below is a linear scan today ---
 / (env.c env_lookup_flat, dict.c ray_dict_find_sym, q_search_find_item,
 /  find_rows_probe col-0 row_scan).  Probes target the LAST key so the

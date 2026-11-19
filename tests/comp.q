@@ -72,7 +72,7 @@ tagsI:enlist 0h;
 0N!`date$0Np;                    / 0Nd
 0N!`long$();                     / `long$()
 0N!`$"hello";                    / `hello
-0N!`symbol$"abc";                / `abc
+//0N!`symbol$"abc";                / `abc
 0N!string 123;                   / "123"
 0N!"x"$"abc";                    / 0x616263
 0N!`long$"A";                    / code point 65

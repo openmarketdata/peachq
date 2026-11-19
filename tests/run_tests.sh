@@ -37,32 +37,54 @@ else
   rm -f tests/.comp.out tests/.comp.diff
 fi
 
-# --- performance: per-case ms vs baseline x 3 ---
+# --- performance: per-case ms vs baseline x 3 (silent unless a case fails) ---
 "$Q" tests/perf.q </dev/null > tests/.perf.out 2>&1
-cat tests/.perf.out
 if [ -f tests/perf.baseline ]; then
-  awk 'NR==FNR { if ($2 ~ /^[0-9]+$/) base[$1]=$2; next }
+  nfail=$(awk 'NR==FNR { if ($2 ~ /^[0-9]+$/) base[$1]=$2; next }
        $2 ~ /^[0-9]+$/ && ($1 in base) {
-         lim = base[$1]*3
-         st = ($2 <= lim) ? "ok" : "FAIL"
-         printf "%-15s %8d ms  baseline %d limit %d  %s\n", $1, $2, base[$1], lim, st
-         if (st == "FAIL") bad = 1
+         lim = base[$1]*3; n++
+         if ($2 > lim) {
+           printf "%-15s %8d ms  baseline %d limit %d  FAIL\n", $1, $2, base[$1], lim > "/dev/stderr"
+           bad++
+         }
        }
-       END { exit bad }' tests/perf.baseline tests/.perf.out || fail=1
+       END { printf "%d %d\n", n, bad+0 }' tests/perf.baseline tests/.perf.out)
+  set -- $nfail
+  if [ "${2:-0}" -gt 0 ]; then fail=1; else echo "performance: PASS (${1:-0} cases)"; fi
 else
   echo "note: no tests/perf.baseline (./tests/run_tests.sh --record to create)"
 fi
 
-# --- reference: current run vs the original pre-optimization numbers ---
-# tests/perf.baseline.orig is a frozen snapshot kept for comparison; it is
-# never rewritten by --record and never gates the run.
-if [ -f tests/perf.baseline.orig ]; then
-  echo "vs original:"
-  awk 'NR==FNR { if ($2 ~ /^[0-9]+$/) orig[$1]=$2; next }
-       $2 ~ /^[0-9]+$/ && ($1 in orig) {
-         r = 0; if ($2 > 0) r = orig[$1] / $2
-         printf "%-15s %8d -> %6d ms  (%.1fx)\n", $1, orig[$1], $2, r
-       }' tests/perf.baseline.orig tests/.perf.out
+# --- reference table: current run vs frozen baselines (ms per case) ----
+# tests/perf.baseline.orig : upstream peachq.org numbers (never rewritten)
+# tests/perf.baseline.k    : kdb,     refreshed manually (../mbo/bin/l64/q tests/perf.q)
+# tests/perf.baseline.l    : l-labs,  refreshed manually (../l/l5 tests/perf.q)
+# Reference only — none of these gate the run.
+o=tests/perf.baseline.orig; [ -f "$o" ] || o=/dev/null
+k=tests/perf.baseline.k;    [ -f "$k" ] || k=/dev/null
+l=tests/perf.baseline.l;    [ -f "$l" ] || l=/dev/null
+if [ "$o$k$l" != "/dev/null/dev/null/dev/null" ]; then
+  printf '%-15s %8s %16s %16s %16s\n' "case" "ours" "orig" "kx" "l5"
+  awk 'FNR==1 { f++ }
+       f==1 { if ($2 ~ /^[0-9]+$/) a[$1]=$2; next }
+       f==2 { if ($2 ~ /^[0-9]+$/) b[$1]=$2; next }
+       f==3 { if ($2 ~ /^[0-9]+$/) c[$1]=$2; next }
+       $2 ~ /^[0-9]+$/ {
+         line = sprintf("%-15s %8d", $1, $2)
+         if ($1 in a)
+           line = line sprintf(" %8d (%4.1fx)", a[$1], ($2 > 0 ? a[$1]/$2 : 0))
+         if ($1 in b) {
+           if (b[$1] == 0) line = line sprintf(" %8d (<1ms)", b[$1])
+           else { r = $2/b[$1]; line = line sprintf(" %8d (%.1fx %s)",
+                          b[$1], (r <= 1 ? 1/r : r), (r <= 1 ? "faster" : "slower")) }
+         } else line = line sprintf(" %16s", "-")
+         if ($1 in c) {
+           if (c[$1] == 0) line = line sprintf(" %8d (<1ms)", c[$1])
+           else { r = $2/c[$1]; line = line sprintf(" %8d (%.1fx %s)",
+                          c[$1], (r <= 1 ? 1/r : r), (r <= 1 ? "faster" : "slower")) }
+         } else line = line sprintf(" %16s", "-")
+         print line
+       }' "$o" "$k" "$l" tests/.perf.out
 fi
 rm -f tests/.perf.out
 
