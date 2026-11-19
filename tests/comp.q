@@ -89,3 +89,41 @@ tagsI:enlist 0h;
 0N!`year$2026.11.17D10:00:00;    / temporal component: year
 0N!meta ([]a:1 2;b:`x`y);        / `t` column rides qnames
 0N!@[{`badtype$x};1;{x}];        / unknown designator -> "badtype" error
+
+/ --- temporal unit-leaf parity: vector cast ~ per-atom cast, every pair with
+/ a cast_range_worker leaf (negatives for the floor law, infinities for the
+/ raw two's-complement multiplies, nulls, pre-2000 civil edges) ---
+SP:`timespan$-90000000000 -1 0 1 59999999999 60000000000 90061000000001,0Wn,-0Wn
+SP[1]:0Nn
+0N!(`minute$SP)~`minute$'SP;
+0N!(`second$SP)~`second$'SP;
+0N!(`time$SP)~`time$'SP;
+TV:`time$-61000 -1 0 1 59999 60000 86399999,0Wt,-0Wt
+0N!(`minute$TV)~`minute$'TV;
+0N!(`second$TV)~`second$'TV;
+0N!(`timespan$TV)~`timespan$'TV;
+SV:`second$-61 -1 0 1 59 60 86399,0Wv,-0Wv
+0N!(`minute$SV)~`minute$'SV;
+0N!(`time$SV)~`time$'SV;
+0N!(`timespan$SV)~`timespan$'SV;
+UV:`minute$-61 -1 0 1 59 60 1439,0Wu,-0Wu
+0N!(`second$UV)~`second$'UV;
+0N!(`time$UV)~`time$'UV;
+0N!(`timespan$UV)~`timespan$'UV;
+PV:1999.12.31D23:59:59.999999999 2000.01.01D00:00:00 1970.01.01D12:00:00 2262.04.11D23:47:16,0Wp,-0Wp
+PV[2]:0Np
+0N!(`date$PV)~`date$'PV;
+0N!(`time$PV)~`time$'PV;
+0N!(`month$PV)~`month$'PV;
+0N!(`datetime$PV)~`datetime$'PV;
+DV:1999.12.31 2000.01.01 1900.03.01 2100.02.28,0Wd,-0Wd
+0N!(`timestamp$DV)~`timestamp$'DV;
+0N!(`datetime$DV)~`datetime$'DV;
+0N!(`month$DV)~`month$'DV;
+ZV:`datetime$PV
+0N!(`timestamp$ZV)~`timestamp$'ZV;
+0N!(`date$ZV)~`date$'ZV;
+0N!(`time$ZV)~`time$'ZV;
+MV:`month$-1 0 238 -1198 1211,0Wi,-0Wi
+0N!(`date$MV)~`date$'MV;
+0N!(`timestamp$MV)~`timestamp$'MV;

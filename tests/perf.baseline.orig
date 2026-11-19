@@ -1,6 +1,10 @@
 minute_vec 947
 second_vec 1000
 month_vec 1722
+month_ts 407
+timestamp_vec 395
+datetime_vec 296
+date_dt 362
 date_vec 6
 int_float 22
 long_boxed 54

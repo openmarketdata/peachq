@@ -18,6 +18,10 @@ rep:{[nm;e] -1 (string nm)," ",string min (first system e;first system e;first s
 rep[`minute_vec;    "t `minute$ts"];            / per-element temporal arm
 rep[`second_vec;    "t `second$ts"];
 rep[`month_vec;     "t `month$dt"];
+rep[`month_ts;      "t `month$ts"];             / timestamp -> month (civil)
+rep[`timestamp_vec; "t `timestamp$dt"];         / datetime -> timestamp (ns)
+rep[`datetime_vec;  "t `datetime$ts"];          / timestamp -> datetime (f64 days)
+rep[`date_dt;       "t `date$dt"];              / datetime -> date (day floor)
 rep[`date_vec;      "t `date$ts"];              / fast range-worker leaf
 rep[`int_float;     "t `int$f"];                / float->int vec loop
 rep[`long_boxed;    "t `long$L"];               / boxed-list distribution

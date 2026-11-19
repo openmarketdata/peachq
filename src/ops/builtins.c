@@ -567,11 +567,43 @@ static ray_t* cast_vec_copy_nulls(ray_t* vec, ray_t* val) {
 } while (0)
 #define CAST_LOOP(R, W, EXPR) CAST_LOOP_RANGE(R, W, EXPR, 0, n2)
 
+/* UNIT-CONVERTING temporal pairs with a tight cast_range_worker leaf.
+ * Each pair mirrors its atom arm's conversion exactly (same expression,
+ * same floor/truncation law) — see the leaves in cast_range_worker.
+ * Pairs NOT listed keep their per-atom semantics (including per-atom
+ * errors, e.g. DATETIME→MONTH which only the q layer composes). */
+static bool cast_unit_pair(int8_t in, int8_t out) {
+    switch (in) {
+    case RAY_TIMESPAN:
+        return out == RAY_MINUTE || out == RAY_SECOND || out == RAY_TIME;
+    case RAY_TIME:
+        return out == RAY_MINUTE || out == RAY_SECOND || out == RAY_TIMESPAN;
+    case RAY_SECOND:
+        return out == RAY_MINUTE || out == RAY_TIME || out == RAY_TIMESPAN;
+    case RAY_MINUTE:
+        return out == RAY_SECOND || out == RAY_TIME || out == RAY_TIMESPAN;
+    case RAY_TIMESTAMP:
+        return out == RAY_DATE || out == RAY_TIME || out == RAY_DATETIME ||
+               out == RAY_MONTH;
+    case RAY_DATE:
+        return out == RAY_TIMESTAMP || out == RAY_DATETIME || out == RAY_MONTH;
+    case RAY_DATETIME:
+        return out == RAY_TIMESTAMP || out == RAY_DATE || out == RAY_TIME;
+    case RAY_MONTH:
+        return out == RAY_DATE || out == RAY_TIMESTAMP;
+    default:
+        return false;
+    }
+}
+
 /* Same-byte-rep type relabels (I64↔TIMESTAMP, I32↔DATE↔TIME): the
  * per-element data is identical, so a single memcpy populates the new
- * vector.  Returns true on hit. */
+ * vector.  Returns true on hit.  A unit-converting pair is NEVER a
+ * relabel even when the widths match (SECOND→MINUTE must divide, not
+ * copy) — those pairs belong to cast_range_worker's unit leaves. */
 static bool cast_vec_relabel_compat(int8_t a, int8_t b) {
     if (a == b) return true;
+    if (cast_unit_pair(a, b)) return false;
     if ((a == RAY_I64 || RAY_IS_TEMPORAL64(a)) &&
         (b == RAY_I64 || RAY_IS_TEMPORAL64(b))) return true;
     if ((a == RAY_I32 || RAY_IS_TEMPORAL32(a)) &&
@@ -579,6 +611,33 @@ static bool cast_vec_relabel_compat(int8_t a, int8_t b) {
     if ((a == RAY_F64 || RAY_IS_TEMPORALF(a)) &&
         (b == RAY_F64 || RAY_IS_TEMPORALF(b))) return true;
     return false;
+}
+
+/* Floor division by a positive constant — the atom arms' narrowing law
+ * (cast.md:168-170 "truncates rather than rounds", toward -inf). */
+static inline int64_t cast_floor_div(int64_t v, int64_t unit) {
+    int64_t q = v / unit;
+    return (v < 0 && q * unit != v) ? q - 1 : q;
+}
+
+/* Civil month of a day count: date_to_ymd's (y, m) as months since 2000.01
+ * — the MONTH atom arm's expression. */
+static inline int32_t cast_days_to_month(int64_t days) {
+    int y, m, d;
+    date_to_ymd((int32_t)days, &y, &m, &d);
+    return (int32_t)((int64_t)(y - 2000) * 12 + (m - 1));
+}
+
+/* The DATE / TIME faces of the datetime split (atom arms' expressions). */
+static inline int32_t cast_dt_to_day(double v) {
+    int64_t d, tod;
+    datetime_to_day_ns(v, &d, &tod);
+    return (int32_t)d;
+}
+static inline int32_t cast_dt_to_timems(double v) {
+    int64_t d, tod;
+    datetime_to_day_ns(v, &d, &tod);
+    return (int32_t)(tod / 1000000LL);
 }
 
 /* Vec→vec numeric cast on raw arrays (no per-element atom allocs).
@@ -618,6 +677,102 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
         /* Floor-mod ns within day, then ns→ms. */
         CAST_LOOP_RANGE(int64_t, int32_t,
                         (int32_t)(ts_ns_in_day(_v) / 1000000LL), lo, hi);
+        return true;
+    }
+    /* Duration-family narrowing: floor-div by the ns/ms unit ratio (the
+     * atom arms' exact expressions; nulls flow through as garbage and are
+     * overwritten by cast_vec_copy_nulls afterward). */
+    if (in_type == RAY_TIMESPAN && out_type == RAY_MINUTE) {
+        CAST_LOOP_RANGE(int64_t, int32_t, (int32_t)cast_floor_div(_v, 60000000000LL), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_TIMESPAN && out_type == RAY_SECOND) {
+        CAST_LOOP_RANGE(int64_t, int32_t, (int32_t)cast_floor_div(_v, 1000000000LL), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_TIMESPAN && out_type == RAY_TIME) {
+        CAST_LOOP_RANGE(int64_t, int32_t, (int32_t)cast_floor_div(_v, 1000000LL), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_TIME && out_type == RAY_MINUTE) {
+        CAST_LOOP_RANGE(int32_t, int32_t, (int32_t)cast_floor_div(_v, 60000LL), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_TIME && out_type == RAY_SECOND) {
+        CAST_LOOP_RANGE(int32_t, int32_t, (int32_t)cast_floor_div(_v, 1000LL), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_SECOND && out_type == RAY_MINUTE) {
+        CAST_LOOP_RANGE(int32_t, int32_t, (int32_t)cast_floor_div(_v, 60LL), lo, hi);
+        return true;
+    }
+    /* Duration-family widening: exact multiplies (unsigned space for the
+     * ns ratios, mirroring temporal_as_ns — kdb infinity arithmetic is raw
+     * two's-complement and C signed overflow is UB). */
+    if (in_type == RAY_MINUTE && out_type == RAY_SECOND) {
+        CAST_LOOP_RANGE(int32_t, int32_t, (int32_t)((int64_t)_v * 60LL), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_MINUTE && out_type == RAY_TIME) {
+        CAST_LOOP_RANGE(int32_t, int32_t, (int32_t)((int64_t)_v * 60000LL), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_SECOND && out_type == RAY_TIME) {
+        CAST_LOOP_RANGE(int32_t, int32_t, (int32_t)((int64_t)_v * 1000LL), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_MINUTE && out_type == RAY_TIMESPAN) {
+        CAST_LOOP_RANGE(int32_t, int64_t, (int64_t)((uint64_t)_v * 60000000000ULL), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_SECOND && out_type == RAY_TIMESPAN) {
+        CAST_LOOP_RANGE(int32_t, int64_t, (int64_t)((uint64_t)_v * 1000000000ULL), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_TIME && out_type == RAY_TIMESPAN) {
+        CAST_LOOP_RANGE(int32_t, int64_t, (int64_t)((uint64_t)_v * 1000000ULL), lo, hi);
+        return true;
+    }
+    /* Timestamp <-> datetime: the f64 day count both atom arms use. */
+    if (in_type == RAY_TIMESTAMP && out_type == RAY_DATETIME) {
+        CAST_LOOP_RANGE(int64_t, double, ts_to_datetime(_v), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_DATETIME && out_type == RAY_TIMESTAMP) {
+        CAST_LOOP_RANGE(double, int64_t, datetime_to_ns(_v), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_DATE && out_type == RAY_DATETIME) {
+        CAST_LOOP_RANGE(int32_t, double, (double)_v, lo, hi);
+        return true;
+    }
+    if (in_type == RAY_DATETIME && out_type == RAY_DATE) {
+        /* Floor to the containing day — the atom arm's datetime split. */
+        CAST_LOOP_RANGE(double, int32_t, cast_dt_to_day(_v), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_DATETIME && out_type == RAY_TIME) {
+        CAST_LOOP_RANGE(double, int32_t, cast_dt_to_timems(_v), lo, hi);
+        return true;
+    }
+    /* Civil truncation to the month / expansion from it. */
+    if (in_type == RAY_TIMESTAMP && out_type == RAY_MONTH) {
+        CAST_LOOP_RANGE(int64_t, int32_t, cast_days_to_month(ts_days_floor(_v)), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_DATE && out_type == RAY_MONTH) {
+        CAST_LOOP_RANGE(int32_t, int32_t, cast_days_to_month((int64_t)_v), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_MONTH && out_type == RAY_DATE) {
+        CAST_LOOP_RANGE(int32_t, int32_t, (int32_t)month_payload_as_days((int64_t)_v), lo, hi);
+        return true;
+    }
+    if (in_type == RAY_MONTH && out_type == RAY_TIMESTAMP) {
+        /* First-of-month midnight (temporal_as_ns's unsigned multiply). */
+        CAST_LOOP_RANGE(int32_t, int64_t,
+                        (int64_t)((uint64_t)month_payload_as_days((int64_t)_v) *
+                                  86400000000000ULL), lo, hi);
         return true;
     }
     /* Generic numeric pairs.  The big switch dispatches on (out_type,
@@ -731,11 +886,30 @@ static void cast_par_fn(void* arg, uint32_t worker_id, int64_t lo, int64_t hi) {
  * through to it produced `month$2019.11.19 2019.12.01 -> 2605.03 2606.03m.
  * Every temporal-target cast arm routes TEMPORAL-source vectors here; the
  * int-family fast path is untouched.  Nulls pass through as typed nulls. */
+static ray_t* cast_vec_numeric_fast(ray_t* val, ray_t* vec, int8_t out_type);
+static void cast_mark_output_sentinels(ray_t* vec, int8_t out_type, int64_t n);
+
 static ray_t* cast_vec_temporal_elems(ray_t* val, int8_t out_type) {
     int64_t n = ray_len(val);
     ray_t* out = ray_vec_new(out_type, n);
     if (!out || RAY_IS_ERR(out)) return out;
     out->len = n;
+    /* Unit-converting pairs with a tight worker leaf skip the per-atom
+     * loop entirely: the raw payload loop (parallel for large vectors),
+     * then source nulls re-stamped as the target's sentinel.  Semantics
+     * match the atom arm per element — the leaves reuse its expressions,
+     * and nulls land exactly where the loop's null branch put them. */
+    if (n > 0 && cast_unit_pair(val->type, out_type)) {
+        ray_t* fast = cast_vec_numeric_fast(val, out, out_type);
+        if (RAY_IS_ERR(fast)) { ray_release(out); return fast; }
+        if (fast) {
+            ray_t* r = cast_vec_copy_nulls(out, val);
+            if (RAY_IS_ERR(r)) return r;
+            cast_mark_output_sentinels(out, out_type, n);
+            return out;
+        }
+        /* NULL = pair unsupported after all — fall through to per-atom. */
+    }
     for (int64_t i = 0; i < n; i++) {
         if (ray_vec_is_null(val, i)) {
             ray_t* nl = ray_typed_null((int8_t)-out_type);
