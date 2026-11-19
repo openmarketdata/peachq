@@ -216,15 +216,71 @@ static ray_t* cast_int(int8_t tag, ray_t* x) {
         if (RAY_IS_ERR(out)) return out;
         out->len = n;
         int is64 = (x->type == RAY_F64);
-        for (int64_t i = 0; i < n; i++) {
-            double v = is64 ? ((const double*)ray_data(x))[i]
-                            : (double)((const float*)ray_data(x))[i];
-            int isnull = isnan(v);
-            int64_t iv = isnull ? 0 : cast_float_lane(tag, v);
-            if      (tag == RAY_I64) ((int64_t*)ray_data(out))[i] = iv;
-            else if (tag == RAY_I32) ((int32_t*)ray_data(out))[i] = (int32_t)iv;
-            else                     ((int16_t*)ray_data(out))[i] = (int16_t)iv;
-            if (isnull) ray_vec_set_null(out, i, true);
+        /* the atom law (cast_float_lane) = clamp rint(v) to the target's
+         * +-0W: the compares short-circuit the convert so no |r| >= 2^63
+         * ever reaches (int64_t) — same result, no per-element inf lookup. */
+        int64_t wi = 0;
+        ray_type_inf(tag, 1, &wi);
+        const double w = (double)wi;
+        if (tag == RAY_I64) {
+            int64_t* d = (int64_t*)ray_data(out);
+            if (is64) {
+                const double* s = (const double*)ray_data(x);
+                for (int64_t i = 0; i < n; i++) {
+                    double v = s[i], r = rint(v);
+                    int isnull = isnan(v);
+                    d[i] = isnull ? 0 : r >= w ? wi : r <= -w ? -wi : (int64_t)r;
+                    if (isnull) ray_vec_set_null(out, i, true);
+                }
+            } else {
+                const float* s = (const float*)ray_data(x);
+                for (int64_t i = 0; i < n; i++) {
+                    double v = (double)s[i], r = rint(v);
+                    int isnull = isnan(v);
+                    d[i] = isnull ? 0 : r >= w ? wi : r <= -w ? -wi : (int64_t)r;
+                    if (isnull) ray_vec_set_null(out, i, true);
+                }
+            }
+        } else if (tag == RAY_I32) {
+            int32_t* d = (int32_t*)ray_data(out);
+            if (is64) {
+                const double* s = (const double*)ray_data(x);
+                for (int64_t i = 0; i < n; i++) {
+                    double v = s[i], r = rint(v);
+                    int isnull = isnan(v);
+                    d[i] = isnull ? 0 : r >= w ? (int32_t)wi : r <= -w ? (int32_t)-wi : (int32_t)r;
+                    if (isnull) ray_vec_set_null(out, i, true);
+                }
+            } else {
+                const float* s = (const float*)ray_data(x);
+                for (int64_t i = 0; i < n; i++) {
+                    float v = s[i];
+                    double r = rint((double)v);
+                    int isnull = isnan(v);
+                    d[i] = isnull ? 0 : r >= w ? (int32_t)wi : r <= -w ? (int32_t)-wi : (int32_t)r;
+                    if (isnull) ray_vec_set_null(out, i, true);
+                }
+            }
+        } else {
+            int16_t* d = (int16_t*)ray_data(out);
+            if (is64) {
+                const double* s = (const double*)ray_data(x);
+                for (int64_t i = 0; i < n; i++) {
+                    double v = s[i], r = rint(v);
+                    int isnull = isnan(v);
+                    d[i] = isnull ? 0 : r >= w ? (int16_t)wi : r <= -w ? (int16_t)-wi : (int16_t)r;
+                    if (isnull) ray_vec_set_null(out, i, true);
+                }
+            } else {
+                const float* s = (const float*)ray_data(x);
+                for (int64_t i = 0; i < n; i++) {
+                    float v = s[i];
+                    double r = rint((double)v);
+                    int isnull = isnan(v);
+                    d[i] = isnull ? 0 : r >= w ? (int16_t)wi : r <= -w ? (int16_t)-wi : (int16_t)r;
+                    if (isnull) ray_vec_set_null(out, i, true);
+                }
+            }
         }
         return out;
     }
