@@ -128,31 +128,40 @@ static inline void datetime_to_day_ns(double val, int64_t* day, int64_t* tod_ns)
 /* A timestamp's datetime: the f64 day count, unrounded. */
 static inline double ts_to_datetime(int64_t ns) { return (double)ns / NS_PER_DAY; }
 
-/* The datetime split WITHOUT __int128, for values whose ns total fits i64
- * (|val*D| < 9e18): identical (day,tod) to datetime_to_day_ns — day =
- * floor(val), tod = round(val*D) - day*D snapped to the ms grid within the
- * day value's ulp, normalized to [0,NS_PER_DAY).  Returns 0 outside the
- * i64 range — caller takes the wide path. */
-static inline int dt_split_i64(double val, int64_t* day, int64_t* tod_ns) {
+/* The datetime's composed ns value WITHOUT __int128, for |val*D| < 9e18:
+ * identical to days*D + tod from datetime_to_day_ns.  day*D is a multiple
+ * of the 1e6 ms grid, so snapping tod to its tick equals snapping ns0 =
+ * round(val*D) to ITS tick — the grid distance |ns0 - tick| is the same
+ * either way, and in-range ulp_ns < 5e5 means the half-tick tie-break
+ * direction can never decide a snap.  The post-snap day normalization
+ * folds into the tick itself.  Returns 0 outside the i64 range — caller
+ * takes the wide path. */
+static inline int dt_ns_i64(double val, int64_t* ns_out) {
     double rd = val * (double)NS_PER_DAY;
     if (!(rd > -9.0e18 && rd < 9.0e18)) return 0;
     int64_t ns0 = (int64_t)round(rd);
-    int64_t d = (int64_t)floor(val);
-    int64_t tod = ns0 - d * (int64_t)NS_PER_DAY;
-    /* ulp of the DAY value, in ns — bit bump = nextafter(fabs(val),INF) */
     double av = fabs(val), up;
     uint64_t b;
     memcpy(&b, &av, 8);
     b += 1;
     memcpy(&up, &b, 8);
     double ulp_ns = (up - av) * (double)NS_PER_DAY;
-    int64_t ms = (tod < 0 ? tod - 500000 : tod + 500000) / 1000000 * 1000000;
-    int64_t diff = tod > ms ? tod - ms : ms - tod;
-    if ((double)diff <= ulp_ns) tod = ms;
-    if (tod < 0) { d -= 1; tod += NS_PER_DAY; }
-    else if (tod >= NS_PER_DAY) { d += 1; tod -= NS_PER_DAY; }
+    int64_t tick = (ns0 < 0 ? ns0 - 500000 : ns0 + 500000) / 1000000 * 1000000;
+    int64_t diff = ns0 > tick ? ns0 - tick : tick - ns0;
+    *ns_out = (double)diff <= ulp_ns ? tick : ns0;
+    return 1;
+}
+
+/* The datetime split WITHOUT __int128, for values whose ns total fits i64
+ * (|val*D| < 9e18): identical (day,tod) to datetime_to_day_ns — day =
+ * floor(ns/D), tod = ns - day*D in [0,NS_PER_DAY).  Returns 0 outside the
+ * i64 range — caller takes the wide path. */
+static inline int dt_split_i64(double val, int64_t* day, int64_t* tod_ns) {
+    int64_t ns;
+    if (!dt_ns_i64(val, &ns)) return 0;
+    int64_t d = ts_days_floor(ns);
     *day = d;
-    *tod_ns = tod;
+    *tod_ns = ns - d * (int64_t)NS_PER_DAY;
     return 1;
 }
 
@@ -162,11 +171,10 @@ static inline int dt_split_i64(double val, int64_t* day, int64_t* tod_ns) {
 static inline int64_t datetime_to_ns(double val) {
     if (!(val > -DATETIME_DAY_MAX && val < DATETIME_DAY_MAX))
         return val < 0 ? -INT64_MAX : INT64_MAX;      /* NaN takes +0Wp */
-    int64_t day, tod;
-    if (dt_split_i64(val, &day, &tod))              /* |ns| < 9e18+D < i64 max */
-        return day * (int64_t)NS_PER_DAY + tod;
+    int64_t day, tod, ns;
+    if (dt_ns_i64(val, &ns))                        /* |ns| < 9e18 < i64 max */
+        return ns;
     datetime_to_day_ns(val, &day, &tod);
-    int64_t ns;
     if (ts_compose_checked(day, tod, &ns)) return ns;
     return day < 0 ? -INT64_MAX : INT64_MAX;
 }
